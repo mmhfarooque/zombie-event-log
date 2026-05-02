@@ -16,7 +16,7 @@ from pathlib import Path
 import gi
 gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
-from gi.repository import Adw, Gdk, GLib, Gio, Gtk  # noqa: E402
+from gi.repository import Adw, Gdk, GLib, Gio, GObject, Gtk  # noqa: E402
 
 
 APP_ID = "net.farooque.ZombieEventLog"
@@ -318,7 +318,7 @@ class ZelWindow(Adw.ApplicationWindow):
         clipboard.set(text)
 
 
-class CycleItem(GLib.Object):
+class CycleItem(GObject.Object):
     __gtype_name__ = "CycleItem"
 
     def __init__(self, cycle_id, compositor, locked, gsp_count):

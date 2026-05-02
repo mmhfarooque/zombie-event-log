@@ -50,6 +50,7 @@ Scope: **broad** — any suspend/resume telemetry, not NVIDIA-specific. NVIDIA G
 | 14:58 | `gh repo create mmhfarooque/zombie-event-log --public --source=. --remote=origin --push` — repo live at <https://github.com/mmhfarooque/zombie-event-log>, MIT license auto-detected, default branch `main`. | ✓ |
 | 15:30 | First user install (`mahmud@ms7e41`) clean — hook + CLI + GUI + desktop entry installed. Surfaced bug: missing icon → KDE menu shows generic doc icon. | ✓ noted |
 | 15:32 | Designed flat SVG icon at `packaging/icons/net.farooque.ZombieEventLog.svg` — bold "Z" on slate gradient background with cyan heartbeat pulse along the bottom (sleep + monitoring metaphor). Updated `install.sh` to copy to `/usr/local/share/icons/hicolor/scalable/apps/`, refresh `gtk-update-icon-cache` and `kbuildsycoca6`. Updated `uninstall.sh` symmetrically. | ✓ |
+| 15:50 | User reported app icon click did nothing — silent crash. Reproduced from terminal: `AttributeError: 'gi.repository.GLib' object has no attribute 'Object'`. Cause: PyGObject base class is `GObject.Object`, not `GLib.Object` (my mistake; muscle memory from older GLib API). Fixed `bin/zel-gui` import + subclass declaration. Re-smoke-tested — window launches cleanly, only a benign libadwaita-vs-KDE-theme warning. | ✓ |
 
 ## v0.1 file inventory
 
