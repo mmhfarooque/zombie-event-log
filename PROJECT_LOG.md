@@ -78,6 +78,27 @@ Scope: **broad** — any suspend/resume telemetry, not NVIDIA-specific. NVIDIA G
 
 **Headline pattern observed:** the bug fires on 100% of suspends (2/2 cycles), KWin rescues on 100% of the cycles where it engages (2/2). Storm intensity (framebuffer error count) scales with nap length — longer nap = more journal lines accumulated during the retry storm before recovery.
 
+### 2026-05-02 — Article phase
+
+| Time | Step | Result |
+|---|---|---|
+| 17:38 | Drafted v1 of the companion blog article at `~/Photography Portfolio Website/articles/kde-vs-gnome-nvidia-suspend-rescue/article.md`. | ✓ |
+| 17:39 | Created `meta.md` with full SEO fields, 15 tags, image inventory (4 images), tinker insert template, GSC/Bing submission steps. | ✓ |
+| 17:40 | Updated `articles/ARTICLE_LOG.md` with entry #2 (Draft — awaiting images). | ✓ |
+| 17:50 | User requested article be **refocused** on industry-wide NVIDIA Linux suspend situation rather than KDE-vs-GNOME comparison alone; tool to be framed as a logger, not a fix. Launched research agent for blog/vlog/issue-tracker citations. | ✓ |
+| 17:55 | Research agent stalled mid-stream after gathering ~30% of targets; took over with direct WebFetch + WebSearch. | ✓ noted |
+| 17:57 | User generated 4 ChatGPT images locally (light/neutral theme palette per the regenerated prompts). | ✓ |
+| 18:00 | Renamed PNGs to slug-based filenames; converted to WebP via cwebp -q 82 -resize 1920 — total 5.6 MB → 410 KB (93% reduction). | ✓ |
+| 18:05 | Rewrote `article.md` (2,630 words) with industry-wide framing, 18 cited sources spanning NVIDIA GitHub issues #1086/#1064/#1080/#1117/#1059/#446, NVIDIA Developer Forums, Arch/Ubuntu/Fedora/Mint forums, Framework Community thread, Phoronix/GamingOnLinux/UbuntuPit driver-release coverage. Tool framed as logger, Kubuntu/KDE recommendation in plain terms. | ✓ |
+| 18:10 | Refreshed `meta.md` SEO: title 91c (long form for page), seo_title 58c (within Google's 60–65c desktop SERP cutoff), meta_description 173c (within 200c mobile cap), 15 tags aligned with current search terms. | ✓ |
+| 18:11 | scp'd 4 WebP images + article.html to mfaruk.com (`/home/mfaruk/web/mfaruk.com/private/portfolio-app/storage/app/public/blog/`); chowned `mfaruk:www-data`, chmod 644. | ✓ |
+| 18:13 | First tinker insert: Post created (id 5, status published, category 6, all images OK), but tag sync failed — `tags` table has no `type` column. Memory entry `reference-mfaruk-blog-conventions.md` was outdated; corrected. | ✓ rescued |
+| 18:14 | Second tinker run with corrected tag schema (Tag::firstOrCreate by name, slug via Str::slug) — 15 tags attached. | ✓ |
+| 18:15 | **Article live at <https://mfaruk.com/blog/kde-vs-gnome-nvidia-suspend-rescue>** — HTTP 200, all 4 images 200, sitemap.xml contains the new URL, ARTICLE_LOG.md flipped to Published. | ✓ |
+| 18:18 | User reported tables on the live post invisible — dark text on dark theme. Diagnosed: `.blog-content` CSS in `resources/js/Pages/Public/Blog/Show.vue` only had rules for headings/paragraphs/lists/code/blockquote/img — `<table>`, `<th>`, `<td>` fell back to browser defaults. | ✓ |
+| 18:21 | Added 8 CSS rules for table elements using existing CSS variables (`--text-primary`, `--text-secondary`, `--bg-tertiary`, `--border`); used Python injection (sed escaping CSS proved too fragile). Backed up Show.vue.bak-2026-05-02 on server. Ran `npm run build`, `php artisan view:clear`, `php artisan cache:clear`. | ✓ |
+| 18:23 | Verified production CSS bundle (`Show-Bm0IfgXp.css`) contains the new rules. Fix applies to **all blog posts** going forward, not just this one. | ✓ |
+
 ## v0.1 file inventory
 
 ```
