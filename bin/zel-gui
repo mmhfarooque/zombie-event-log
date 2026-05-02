@@ -9,6 +9,7 @@ Wraps the bash CLI (`zel`) as the single source of classification truth.
 import json
 import os
 import shlex
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -24,7 +25,7 @@ APP_VERSION = "0.1.0"
 
 DATA_DIR = Path(os.environ.get("ZEL_DATA_DIR", "/var/lib/zel"))
 CYCLES_DIR = DATA_DIR / "cycles"
-ZEL_BIN = "zel"
+ZEL_BIN = shutil.which("zel") or "/usr/local/bin/zel"
 
 
 def run_zel(args, capture=True):
@@ -128,7 +129,9 @@ class ZelWindow(Adw.ApplicationWindow):
 
         self.list_store = Gio.ListStore.new(CycleItem)
         self.selection = Gtk.SingleSelection.new(self.list_store)
-        self.selection.connect("selection-changed", self.on_selection_changed)
+        self.selection.set_can_unselect(False)
+        # notify::selected fires reliably on click; selection-changed is for batched changes
+        self.selection.connect("notify::selected", self.on_selection_changed)
 
         factory = Gtk.SignalListItemFactory()
         factory.connect("setup", self._row_setup)
@@ -136,6 +139,8 @@ class ZelWindow(Adw.ApplicationWindow):
 
         self.list_view = Gtk.ListView.new(self.selection, factory)
         self.list_view.add_css_class("navigation-sidebar")
+        # ListView::activate fires on double-click / Enter — same handler
+        self.list_view.connect("activate", self.on_row_activate)
         list_scroller.set_child(self.list_view)
 
         # ---- Right: detail pane ----
@@ -218,8 +223,13 @@ class ZelWindow(Adw.ApplicationWindow):
                 "No cycles recorded yet — install zel and suspend/resume once.",
                 "warning",
             )
+            self.detail_label.set_text("Select a cycle to view details.")
+            self.detail_buffer.set_text("")
         else:
             self.banner.set_revealed(False)
+            # Auto-select and show the most recent cycle on first load.
+            self.selection.set_selected(0)
+            self._show_selected()
 
     def show_banner(self, text, kind="info"):
         self.banner.set_title(text)
@@ -237,12 +247,19 @@ class ZelWindow(Adw.ApplicationWindow):
         return item.cycle_id if item else None
 
     def on_selection_changed(self, *_args):
+        self._show_selected()
+
+    def on_row_activate(self, _listview, _position):
+        self._show_selected()
+
+    def _show_selected(self):
         cid = self.get_selected_cycle()
         if not cid:
             return
         self.detail_label.set_text(f"Cycle {cid}")
+        self.detail_buffer.set_text("Loading…")
         rc, out, err = run_zel(["show", cid])
-        text = out if rc == 0 else f"(error)\n{err}"
+        text = out if rc == 0 else f"(error running `zel show {cid}`)\n\n{err or '(no stderr)'}"
         self.detail_buffer.set_text(text)
 
     def on_copy_selected(self, _btn):

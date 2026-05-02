@@ -32,7 +32,10 @@ zel_adapter_kwin() {
         return
     fi
 
-    # Find timestamp of last atomic-modeset failure vs end of slice.
+    # The cardinal failure signal is "Atomic modeset test failed!" — when KWin
+    # stops emitting that, recovery has happened. The framebuffer/scene errors
+    # are downstream symptoms of the modeset state and cluster around it, so
+    # they're useful for counts but not for "when did the storm end".
     local last_fail_line
     last_fail_line=$(echo "$journal" | grep -n "Atomic modeset test failed" | tail -1 | cut -d: -f1)
     local total_lines
@@ -47,14 +50,35 @@ zel_adapter_kwin() {
     local tail_gap=$((total_lines - last_fail_line))
     echo "kwin_tail_gap_lines=$tail_gap"
 
-    # If the final 25% of the slice is failure-free, we likely recovered.
+    # Confidence ladder based on how unambiguous the rescue evidence is.
+    #
+    #   high     — gap > 1000 lines AND > 25% of slice. Compositor clearly
+    #              ran cleanly for a long time after the storm.
+    #   medium   — gap > 25% of slice but small in absolute terms (short
+    #              journal slice, brief recovery period).
+    #   low      — gap exists but is tiny (rescue uncertain, edge case).
+    #
+    # Catastrophic mirror:
+    #   high     — failures span into the final 5% of the slice.
+    #   medium   — failures into final 25% but not the very tail.
     local quarter=$((total_lines / 4))
     [ "$quarter" -lt 50 ] && quarter=50
+    local last_5pct=$((total_lines / 20))
+    [ "$last_5pct" -lt 20 ] && last_5pct=20
+
     if [ "$tail_gap" -gt "$quarter" ]; then
         echo "outcome=rescued"
-        echo "outcome_confidence=medium"
+        if [ "$tail_gap" -gt 1000 ]; then
+            echo "outcome_confidence=high"
+        else
+            echo "outcome_confidence=medium"
+        fi
     else
         echo "outcome=catastrophic"
-        echo "outcome_confidence=medium"
+        if [ "$tail_gap" -lt "$last_5pct" ]; then
+            echo "outcome_confidence=high"
+        else
+            echo "outcome_confidence=medium"
+        fi
     fi
 }
