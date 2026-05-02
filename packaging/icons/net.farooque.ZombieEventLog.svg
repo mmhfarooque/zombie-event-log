@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#1e293b"/>
+      <stop offset="1" stop-color="#0f172a"/>
+    </linearGradient>
+  </defs>
+  <rect width="256" height="256" rx="48" fill="url(#bg)"/>
+  <polyline points="64,72 192,72 64,166 192,166"
+            fill="none" stroke="#f1f5f9" stroke-width="26"
+            stroke-linejoin="miter" stroke-linecap="square"/>
+  <polyline points="32,210 72,210 92,190 108,230 124,210 224,210"
+            fill="none" stroke="#22d3ee" stroke-width="6"
+            stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

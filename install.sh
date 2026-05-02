@@ -16,6 +16,7 @@ GUI_DST=/usr/local/bin/zel-gui
 LIB_DST=/usr/local/share/zel/lib
 DATA_DST=/var/lib/zel/cycles
 DESKTOP_DST=/usr/local/share/applications/zel-gui.desktop
+ICON_DST=/usr/local/share/icons/hicolor/scalable/apps/net.farooque.ZombieEventLog.svg
 
 echo "zel — installing from $SRC_DIR"
 
@@ -47,10 +48,20 @@ if python3 -c "import gi; gi.require_version('Gtk','4.0'); gi.require_version('A
     install -m 0755 "$SRC_DIR/bin/zel-gui" "$GUI_DST"
     install -d -m 0755 /usr/local/share/applications
     install -m 0644 "$SRC_DIR/packaging/zel-gui.desktop" "$DESKTOP_DST"
+    install -d -m 0755 /usr/local/share/icons/hicolor/scalable/apps
+    install -m 0644 "$SRC_DIR/packaging/icons/net.farooque.ZombieEventLog.svg" "$ICON_DST"
     if command -v update-desktop-database >/dev/null 2>&1; then
         update-desktop-database -q /usr/local/share/applications 2>/dev/null || true
     fi
-    echo "  + $GUI_DST + desktop entry"
+    if command -v gtk-update-icon-cache >/dev/null 2>&1; then
+        gtk-update-icon-cache -q -t /usr/local/share/icons/hicolor 2>/dev/null || true
+    fi
+    if command -v kbuildsycoca6 >/dev/null 2>&1; then
+        kbuildsycoca6 --noincremental >/dev/null 2>&1 || true
+    elif command -v kbuildsycoca5 >/dev/null 2>&1; then
+        kbuildsycoca5 --noincremental >/dev/null 2>&1 || true
+    fi
+    echo "  + $GUI_DST + desktop entry + icon"
 else
     echo "  - skipping zel-gui (install python3-gi + gir1.2-gtk-4.0 + gir1.2-adw-1 to enable)"
 fi
