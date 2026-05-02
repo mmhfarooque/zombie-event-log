@@ -1,0 +1,40 @@
+#!/bin/bash
+# zel — Zombie Event Log CLI
+# Query passive suspend/resume telemetry written by /usr/lib/systemd/system-sleep/50-zel.
+
+set -u
+
+# Locate the lib dir. System install first, dev fallback second.
+if [ -d /usr/local/share/zel/lib ]; then
+    ZEL_LIB_DIR=/usr/local/share/zel/lib
+elif [ -d /usr/share/zel/lib ]; then
+    ZEL_LIB_DIR=/usr/share/zel/lib
+else
+    ZEL_LIB_DIR="$(cd "$(dirname "$(readlink -f "$0")")/../lib" 2>/dev/null && pwd)"
+fi
+export ZEL_LIB_DIR
+
+if [ ! -f "$ZEL_LIB_DIR/core.sh" ]; then
+    echo "zel: cannot locate core.sh (looked at $ZEL_LIB_DIR)" >&2
+    exit 1
+fi
+
+# shellcheck source=../lib/core.sh
+source "$ZEL_LIB_DIR/core.sh"
+
+cmd="${1:-help}"
+shift 2>/dev/null || true
+
+case "$cmd" in
+    stats)        zel_stats "$@" ;;
+    last)         zel_last "$@" ;;
+    catastrophic) zel_catastrophic "$@" ;;
+    list)         zel_list "$@" ;;
+    show)         zel_show "$@" ;;
+    compare)      zel_compare "$@" ;;
+    export)       zel_export "$@" ;;
+    doctor)       zel_doctor "$@" ;;
+    version|--version|-v) echo "zel $ZEL_VERSION" ;;
+    help|--help|-h) zel_help ;;
+    *)            echo "zel: unknown command: $cmd"; echo; zel_help; exit 2 ;;
+esac

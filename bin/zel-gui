@@ -1,0 +1,361 @@
+#!/usr/bin/env python3
+"""
+zel-gui — Zombie Event Log graphical browser.
+
+GTK4 + libadwaita. Native look on GNOME, KDE, Mint, Fedora.
+Wraps the bash CLI (`zel`) as the single source of classification truth.
+"""
+
+import json
+import os
+import shlex
+import subprocess
+import sys
+from pathlib import Path
+
+import gi
+gi.require_version("Gtk", "4.0")
+gi.require_version("Adw", "1")
+from gi.repository import Adw, Gdk, GLib, Gio, Gtk  # noqa: E402
+
+
+APP_ID = "net.farooque.ZombieEventLog"
+APP_VERSION = "0.1.0"
+
+DATA_DIR = Path(os.environ.get("ZEL_DATA_DIR", "/var/lib/zel"))
+CYCLES_DIR = DATA_DIR / "cycles"
+ZEL_BIN = "zel"
+
+
+def run_zel(args, capture=True):
+    """Invoke the bash CLI; return (rc, stdout, stderr)."""
+    try:
+        cmd = [ZEL_BIN, *args]
+        proc = subprocess.run(
+            cmd, capture_output=capture, text=True, timeout=30, check=False
+        )
+        return proc.returncode, proc.stdout, proc.stderr
+    except FileNotFoundError:
+        return 127, "", f"{ZEL_BIN} not found in PATH"
+    except subprocess.TimeoutExpired:
+        return 124, "", "zel command timed out"
+
+
+def list_cycles():
+    """Read cycle JSON files directly for fast list rendering."""
+    if not CYCLES_DIR.is_dir():
+        return []
+    cycles = []
+    for path in sorted(CYCLES_DIR.glob("*.json"), reverse=True):
+        try:
+            with path.open() as fh:
+                data = json.load(fh)
+            cycles.append(data)
+        except (OSError, json.JSONDecodeError):
+            continue
+    return cycles
+
+
+def parse_classifier_output(text):
+    """Parse key=value lines into a dict."""
+    out = {}
+    for line in text.splitlines():
+        if "=" in line:
+            k, v = line.split("=", 1)
+            out[k.strip()] = v.strip()
+    return out
+
+
+class ZelWindow(Adw.ApplicationWindow):
+    def __init__(self, app):
+        super().__init__(application=app)
+        self.set_title("Zombie Event Log")
+        self.set_default_size(1100, 720)
+
+        # Toast overlay for transient feedback
+        self.toast_overlay = Adw.ToastOverlay()
+        self.set_content(self.toast_overlay)
+
+        # Outer vertical layout
+        root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        self.toast_overlay.set_child(root)
+
+        # Header bar with toolbar buttons
+        header = Adw.HeaderBar()
+        root.append(header)
+
+        refresh_btn = Gtk.Button.new_from_icon_name("view-refresh-symbolic")
+        refresh_btn.set_tooltip_text("Read log (refresh)")
+        refresh_btn.connect("clicked", self.on_refresh)
+        header.pack_start(refresh_btn)
+
+        copy_one_btn = Gtk.Button.new_from_icon_name("edit-copy-symbolic")
+        copy_one_btn.set_tooltip_text("Copy selected cycle")
+        copy_one_btn.connect("clicked", self.on_copy_selected)
+        header.pack_start(copy_one_btn)
+
+        copy_all_btn = Gtk.Button.new_from_icon_name("edit-select-all-symbolic")
+        copy_all_btn.set_tooltip_text("Copy all logs (JSONL)")
+        copy_all_btn.connect("clicked", self.on_copy_all)
+        header.pack_start(copy_all_btn)
+
+        clear_btn = Gtk.Button.new_from_icon_name("user-trash-symbolic")
+        clear_btn.set_tooltip_text("Clear all logs (requires sudo)")
+        clear_btn.add_css_class("destructive-action")
+        clear_btn.connect("clicked", self.on_clear)
+        header.pack_end(clear_btn)
+
+        doctor_btn = Gtk.Button.new_from_icon_name("emblem-system-symbolic")
+        doctor_btn.set_tooltip_text("Doctor (environment check)")
+        doctor_btn.connect("clicked", self.on_doctor)
+        header.pack_end(doctor_btn)
+
+        # Status bar (banner)
+        self.banner = Adw.Banner()
+        self.banner.set_revealed(False)
+        root.append(self.banner)
+
+        # Two-pane split: cycle list | detail
+        paned = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL)
+        paned.set_position(380)
+        paned.set_vexpand(True)
+        root.append(paned)
+
+        # ---- Left: cycle list ----
+        list_scroller = Gtk.ScrolledWindow()
+        list_scroller.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        paned.set_start_child(list_scroller)
+
+        self.list_store = Gio.ListStore.new(CycleItem)
+        self.selection = Gtk.SingleSelection.new(self.list_store)
+        self.selection.connect("selection-changed", self.on_selection_changed)
+
+        factory = Gtk.SignalListItemFactory()
+        factory.connect("setup", self._row_setup)
+        factory.connect("bind", self._row_bind)
+
+        self.list_view = Gtk.ListView.new(self.selection, factory)
+        self.list_view.add_css_class("navigation-sidebar")
+        list_scroller.set_child(self.list_view)
+
+        # ---- Right: detail pane ----
+        detail_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        paned.set_end_child(detail_box)
+
+        self.detail_label = Gtk.Label(label="Select a cycle to view details.")
+        self.detail_label.set_xalign(0)
+        self.detail_label.add_css_class("title-3")
+        self.detail_label.set_margin_top(12)
+        self.detail_label.set_margin_start(16)
+        self.detail_label.set_margin_end(16)
+        detail_box.append(self.detail_label)
+
+        detail_scroller = Gtk.ScrolledWindow()
+        detail_scroller.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        detail_scroller.set_vexpand(True)
+        detail_scroller.set_margin_top(8)
+        detail_scroller.set_margin_start(16)
+        detail_scroller.set_margin_end(16)
+        detail_scroller.set_margin_bottom(16)
+        detail_box.append(detail_scroller)
+
+        self.detail_buffer = Gtk.TextBuffer()
+        self.detail_view = Gtk.TextView.new_with_buffer(self.detail_buffer)
+        self.detail_view.set_editable(False)
+        self.detail_view.set_monospace(True)
+        self.detail_view.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
+        detail_scroller.set_child(self.detail_view)
+
+        # Status footer
+        self.status_label = Gtk.Label(label="")
+        self.status_label.set_xalign(0)
+        self.status_label.set_margin_start(12)
+        self.status_label.set_margin_end(12)
+        self.status_label.set_margin_top(6)
+        self.status_label.set_margin_bottom(6)
+        self.status_label.add_css_class("dim-label")
+        root.append(self.status_label)
+
+        # Initial load
+        self.refresh()
+
+    # ---------- list factory ----------
+    def _row_setup(self, _factory, list_item):
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        box.set_margin_top(8)
+        box.set_margin_bottom(8)
+        box.set_margin_start(12)
+        box.set_margin_end(12)
+        title = Gtk.Label(xalign=0)
+        title.add_css_class("heading")
+        subtitle = Gtk.Label(xalign=0)
+        subtitle.add_css_class("caption")
+        subtitle.add_css_class("dim-label")
+        box.append(title)
+        box.append(subtitle)
+        list_item.set_child(box)
+        list_item._title = title
+        list_item._subtitle = subtitle
+
+    def _row_bind(self, _factory, list_item):
+        item = list_item.get_item()
+        list_item._title.set_text(item.cycle_id)
+        list_item._subtitle.set_text(
+            f"{item.compositor} · locked={item.locked} · GSP={item.gsp_count}"
+        )
+
+    # ---------- actions ----------
+    def refresh(self):
+        cycles = list_cycles()
+        self.list_store.remove_all()
+        for c in cycles:
+            self.list_store.append(CycleItem.from_dict(c))
+        self.status_label.set_text(
+            f"{len(cycles)} cycles  ·  data: {CYCLES_DIR}"
+        )
+        if not cycles:
+            self.show_banner(
+                "No cycles recorded yet — install zel and suspend/resume once.",
+                "warning",
+            )
+        else:
+            self.banner.set_revealed(False)
+
+    def show_banner(self, text, kind="info"):
+        self.banner.set_title(text)
+        self.banner.set_revealed(True)
+
+    def toast(self, text):
+        self.toast_overlay.add_toast(Adw.Toast.new(text))
+
+    def on_refresh(self, _btn):
+        self.refresh()
+        self.toast("Reloaded")
+
+    def get_selected_cycle(self):
+        item = self.selection.get_selected_item()
+        return item.cycle_id if item else None
+
+    def on_selection_changed(self, *_args):
+        cid = self.get_selected_cycle()
+        if not cid:
+            return
+        self.detail_label.set_text(f"Cycle {cid}")
+        rc, out, err = run_zel(["show", cid])
+        text = out if rc == 0 else f"(error)\n{err}"
+        self.detail_buffer.set_text(text)
+
+    def on_copy_selected(self, _btn):
+        cid = self.get_selected_cycle()
+        if not cid:
+            self.toast("No cycle selected")
+            return
+        text = self.detail_buffer.get_text(
+            self.detail_buffer.get_start_iter(),
+            self.detail_buffer.get_end_iter(),
+            include_hidden_chars=False,
+        )
+        self.copy_to_clipboard(text)
+        self.toast(f"Copied cycle {cid}")
+
+    def on_copy_all(self, _btn):
+        rc, out, err = run_zel(["export", "/tmp/zel-export.jsonl"])
+        if rc != 0:
+            self.toast(f"Export failed: {err.strip() or rc}")
+            return
+        try:
+            text = Path("/tmp/zel-export.jsonl").read_text()
+        except OSError as e:
+            self.toast(f"Read failed: {e}")
+            return
+        self.copy_to_clipboard(text)
+        self.toast(f"Copied {text.count(chr(10))} cycles")
+
+    def on_clear(self, _btn):
+        dlg = Adw.MessageDialog.new(
+            self,
+            "Clear all zombie event logs?",
+            f"This will permanently delete every file in {CYCLES_DIR}. "
+            "This cannot be undone.",
+        )
+        dlg.add_response("cancel", "Cancel")
+        dlg.add_response("clear", "Clear all")
+        dlg.set_response_appearance("clear", Adw.ResponseAppearance.DESTRUCTIVE)
+        dlg.set_default_response("cancel")
+        dlg.connect("response", self._on_clear_response)
+        dlg.present()
+
+    def _on_clear_response(self, _dlg, response):
+        if response != "clear":
+            return
+        # Use pkexec for the privileged delete.
+        cmd = [
+            "pkexec",
+            "sh",
+            "-c",
+            f"rm -f {shlex.quote(str(CYCLES_DIR))}/*.json",
+        ]
+        proc = subprocess.run(cmd, capture_output=True, text=True)
+        if proc.returncode == 0:
+            self.toast("Logs cleared")
+            self.refresh()
+        else:
+            self.toast(f"Clear failed: {proc.stderr.strip() or proc.returncode}")
+
+    def on_doctor(self, _btn):
+        rc, out, err = run_zel(["doctor"])
+        text = out if rc == 0 else f"(error)\n{err}"
+        dlg = Adw.MessageDialog.new(self, "zel doctor", text)
+        dlg.add_response("ok", "Close")
+        dlg.set_default_response("ok")
+        dlg.present()
+
+    def copy_to_clipboard(self, text):
+        display = Gdk.Display.get_default()
+        if display is None:
+            return
+        clipboard = display.get_clipboard()
+        clipboard.set(text)
+
+
+class CycleItem(GLib.Object):
+    __gtype_name__ = "CycleItem"
+
+    def __init__(self, cycle_id, compositor, locked, gsp_count):
+        super().__init__()
+        self.cycle_id = cycle_id
+        self.compositor = compositor
+        self.locked = locked
+        self.gsp_count = gsp_count
+
+    @classmethod
+    def from_dict(cls, d):
+        # GSP count is computed lazily by `zel show`; for the list view we
+        # show the recorded compositor + lock state and leave GSP="?" until
+        # the user clicks the row (cheap; avoids running journalctl per row).
+        return cls(
+            cycle_id=d.get("cycle_id", "?"),
+            compositor=d.get("compositor", "?"),
+            locked=d.get("locked_at_suspend", "?"),
+            gsp_count="?",
+        )
+
+
+class ZelApp(Adw.Application):
+    def __init__(self):
+        super().__init__(application_id=APP_ID, flags=Gio.ApplicationFlags.DEFAULT_FLAGS)
+
+    def do_activate(self):
+        win = self.props.active_window
+        if not win:
+            win = ZelWindow(self)
+        win.present()
+
+
+def main():
+    app = ZelApp()
+    return app.run(sys.argv)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

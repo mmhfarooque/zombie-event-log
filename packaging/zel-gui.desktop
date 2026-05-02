@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Zombie Event Log
+GenericName=Suspend/Resume Telemetry
+Comment=Browse and manage suspend/resume zombie events
+Icon=net.farooque.ZombieEventLog
+Exec=zel-gui
+Terminal=false
+Categories=System;Monitor;Utility;
+StartupNotify=true
+Keywords=suspend;resume;sleep;zombie;wake;hibernate;
+X-GNOME-Provides=system-monitor

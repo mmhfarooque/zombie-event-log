@@ -1,0 +1,119 @@
+#!/bin/bash
+# zel — Zombie Event Log systemd-sleep hook
+#
+# Invoked by systemd-sleep on every suspend/resume cycle.
+# Phase 1 (pre): writes cycle metadata to /var/lib/zel/cycles/<id>.json
+# Phase 2 (post): appends resume timestamp to the same file
+#
+# Classification (clean / rescued / catastrophic) is deferred to the CLI.
+
+set -u
+
+ZEL_DATA_DIR="${ZEL_DATA_DIR:-/var/lib/zel}"
+ZEL_CYCLES_DIR="${ZEL_DATA_DIR}/cycles"
+ZEL_CURRENT_FILE="${ZEL_DATA_DIR}/.current-cycle"
+
+mkdir -p "$ZEL_CYCLES_DIR"
+chmod 0755 "$ZEL_DATA_DIR" "$ZEL_CYCLES_DIR"
+
+phase="${1:-}"   # pre | post
+event="${2:-}"   # suspend | hibernate | hybrid-sleep | suspend-then-hibernate
+
+detect_compositor() {
+    if pgrep -x kwin_wayland >/dev/null 2>&1; then echo "kwin_wayland"; return; fi
+    if pgrep -x kwin_x11      >/dev/null 2>&1; then echo "kwin_x11";      return; fi
+    if pgrep -x gnome-shell   >/dev/null 2>&1; then echo "gnome-shell";   return; fi
+    if pgrep -x cinnamon      >/dev/null 2>&1; then echo "cinnamon";      return; fi
+    if pgrep -x xfwm4         >/dev/null 2>&1; then echo "xfwm4";         return; fi
+    if pgrep -x sway          >/dev/null 2>&1; then echo "sway";          return; fi
+    if pgrep -x hyprland      >/dev/null 2>&1; then echo "hyprland";      return; fi
+    echo "unknown"
+}
+
+detect_lock_state() {
+    if ! command -v loginctl >/dev/null 2>&1; then echo "unknown"; return; fi
+    local state="no"
+    while read -r sid _; do
+        [ -z "$sid" ] && continue
+        local hint
+        hint=$(loginctl show-session "$sid" -p LockedHint 2>/dev/null | cut -d= -f2)
+        if [ "$hint" = "yes" ]; then state="yes"; break; fi
+    done < <(loginctl list-sessions --no-legend 2>/dev/null)
+    echo "$state"
+}
+
+json_escape() {
+    # minimal escape for JSON string values
+    printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e ':a;N;$!ba;s/\n/\\n/g'
+}
+
+case "$phase" in
+    pre)
+        cycle_id=$(date +%Y%m%d-%H%M%S)
+        echo "$cycle_id" > "$ZEL_CURRENT_FILE"
+
+        compositor=$(detect_compositor)
+        locked=$(detect_lock_state)
+        kernel=$(uname -r)
+        host=$(hostname)
+        suspend_iso=$(date -Iseconds)
+        suspend_epoch=$(date +%s)
+
+        cat > "$ZEL_CYCLES_DIR/$cycle_id.json" <<EOF
+{
+  "cycle_id": "$cycle_id",
+  "schema_version": 1,
+  "event_type": "$(json_escape "$event")",
+  "suspend_at": "$suspend_iso",
+  "suspend_at_epoch": $suspend_epoch,
+  "resume_at": null,
+  "resume_at_epoch": null,
+  "compositor": "$(json_escape "$compositor")",
+  "locked_at_suspend": "$locked",
+  "kernel": "$(json_escape "$kernel")",
+  "hostname": "$(json_escape "$host")"
+}
+EOF
+        chmod 0644 "$ZEL_CYCLES_DIR/$cycle_id.json"
+        ;;
+
+    post)
+        cycle_id=""
+        [ -f "$ZEL_CURRENT_FILE" ] && cycle_id=$(cat "$ZEL_CURRENT_FILE" 2>/dev/null)
+        resume_iso=$(date -Iseconds)
+        resume_epoch=$(date +%s)
+
+        if [ -z "$cycle_id" ] || [ ! -f "$ZEL_CYCLES_DIR/$cycle_id.json" ]; then
+            # Resume without matching pre — record an orphan.
+            cycle_id=$(date +%Y%m%d-%H%M%S)
+            cat > "$ZEL_CYCLES_DIR/$cycle_id.json" <<EOF
+{
+  "cycle_id": "$cycle_id",
+  "schema_version": 1,
+  "event_type": "$(json_escape "$event")",
+  "suspend_at": null,
+  "suspend_at_epoch": null,
+  "resume_at": "$resume_iso",
+  "resume_at_epoch": $resume_epoch,
+  "compositor": "unknown",
+  "locked_at_suspend": "unknown",
+  "kernel": "$(json_escape "$(uname -r)")",
+  "hostname": "$(json_escape "$(hostname)")",
+  "note": "resume_without_pre"
+}
+EOF
+            chmod 0644 "$ZEL_CYCLES_DIR/$cycle_id.json"
+        else
+            # Append resume fields without requiring jq.
+            tmpfile=$(mktemp "$ZEL_CYCLES_DIR/.$cycle_id.XXXXXX")
+            sed -e "s|\"resume_at\": null|\"resume_at\": \"$resume_iso\"|" \
+                -e "s|\"resume_at_epoch\": null|\"resume_at_epoch\": $resume_epoch|" \
+                "$ZEL_CYCLES_DIR/$cycle_id.json" > "$tmpfile"
+            mv "$tmpfile" "$ZEL_CYCLES_DIR/$cycle_id.json"
+            chmod 0644 "$ZEL_CYCLES_DIR/$cycle_id.json"
+        fi
+        rm -f "$ZEL_CURRENT_FILE"
+        ;;
+esac
+
+exit 0
