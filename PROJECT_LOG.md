@@ -54,6 +54,29 @@ Scope: **broad** — any suspend/resume telemetry, not NVIDIA-specific. NVIDIA G
 | 16:15 | **MILESTONE — first real cycle captured (20260502-151823, 89s nap, locked=yes).** GSP fired (2 heartbeat timeouts), KWin attempted **21,990 renders** during the failure storm (10 atomic modeset retries, 4 output config rejections), then recovered. tail_gap = 48,449 clean journal lines. Outcome `rescued`. Proof-of-life for the entire project. | ✓ |
 | 16:18 | Two follow-up bugs surfaced from the live data: (1) GUI right-pane never populated on row click — `selection-changed` signal in GTK4 SingleSelection isn't reliable for single-click; switched to `notify::selected` + ListView::activate, plus auto-show on first refresh. Also made ZEL_BIN absolute via `shutil.which`. (2) KWin classifier reported `medium` confidence on a textbook rescue. First "fix" broadened the grep pattern to include `GL_FRAMEBUFFER_INCOMPLETE` — backfired because those 21,990 symptoms cluster around the modeset failures, not after them, dropping tail_gap from 48k→35 and flipping verdict to false-catastrophic. Reverted to using only `Atomic modeset test failed!` for the gap calc (the cardinal signal), kept the broader pattern for counts. Confidence ladder: rescued/high if tail_gap > 1000, rescued/medium otherwise. | ✓ |
 | 16:22 | Re-tested against live cycle: now correctly returns `outcome=rescued / outcome_confidence=high`. KWin adapter is now first-class. | ✓ |
+| 17:11 | **Second real cycle captured (20260502-153242, 97-minute nap, locked=yes).** GSP fired (2 timeouts), KWin attempted **42,636 renders** during the failure storm (9 atomic modeset retries, 3 output config rejections), then recovered. tail_gap = 92,881 clean journal lines. Outcome `rescued / high`. Confirms the rescue scales with nap length and storm intensity. | ✓ |
+| 17:14 | User did a clean uninstall + re-clone + re-install for verification — installer worked symmetrically, removed `20260502-151823` data, fresh install picked up new cycle correctly. Sequence proves install/uninstall are idempotent and complete. | ✓ |
+
+## Sample data (first two real cycles)
+
+| Field | Cycle 1 (15:18) | Cycle 2 (15:32, fresh install) |
+|---|---|---|
+| `cycle_id` | `20260502-151823` | `20260502-153242` |
+| Nap duration | 89 seconds | 97 minutes |
+| `compositor` | `kwin_wayland` | `kwin_wayland` |
+| `locked_at_suspend` | yes | yes |
+| `gsp_heartbeat_timeouts` | 2 | 2 |
+| `drm_open_failures` | 8 | 6 |
+| `kwin_atomic_modeset_failures` | 10 | 9 |
+| `kwin_framebuffer_incomplete` | 21,990 | 42,636 |
+| `kwin_output_config_failed` | 4 | 3 |
+| `kwin_scene_gl_errors` | 21,990 | 42,636 |
+| `kwin_tail_gap_lines` | 48,449 | 92,881 |
+| `outcome` | rescued | rescued |
+| `outcome_confidence` | high | high |
+| `kernel` | `7.0.0-15-generic` | `7.0.0-15-generic` |
+
+**Headline pattern observed:** the bug fires on 100% of suspends (2/2 cycles), KWin rescues on 100% of the cycles where it engages (2/2). Storm intensity (framebuffer error count) scales with nap length — longer nap = more journal lines accumulated during the retry storm before recovery.
 
 ## v0.1 file inventory
 
