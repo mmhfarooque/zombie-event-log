@@ -231,3 +231,34 @@ classifier_run_at[_epoch]
 
 v1 cycle.json files (the three captured 2026-05-02 / 2026-05-03 with `schema_version: 1`) work unmodified — `zel show` re-runs the classifier and writes a v2 classifier.json into the cache. Field availability depends on whether the journal still has the slice (systemd journals rotate on disk pressure or `journalctl --vacuum-time`). Old v1 cycles continue to be classifiable as long as their journal slice is reachable.
 
+### 2026-05-03 evening — mutter live-USB experiment plan (next session)
+
+After v0.2.0 ship, scoped the next experiment: capture a **mutter** zombie cycle on the same hardware (Mahmud's ms7e41) by booting Ubuntu 26.04 Desktop from a live USB, to produce the A/B story for the article — same NVIDIA-open driver, same GSP bug, different compositor.
+
+**Procedure documented at `docs/EXPERIMENT-MUTTER-LIVE-USB.md`** — has an AI-assistant preamble, an 8-step procedure, a copy-paste cheat sheet, and the KWin reference cycles (C1/C2/C3) for comparison.
+
+| Time | Step | Result |
+|---|---|---|
+| 17:00 | Decided **no Ventoy** — Ubuntu Desktop ISO is hybrid-bootable; KDE Startup Disk Creator dd's it straight to the stick. Single live session, install everything in tmpfs, no persistence needed because we never reboot the live USB. | ✓ |
+| 17:05 | Wrote `docs/EXPERIMENT-MUTTER-LIVE-USB.md` (~190 lines). Sections: prerequisites, switch from nouveau to NVIDIA in one session, install zel + jq + ssh, set up SSH from laptop (critical — survives a zombie state), trigger long suspend, observe and capture from laptop SSH session, exfiltrate evidence to NAS or GitHub gist. Includes a 25-line copy-paste cheat sheet for the whole flow. | ✓ |
+| 17:10 | Added an "If you are an AI assistant" preamble at the top of the experiment doc — so a fresh Claude (or other LLM) session on the live USB can be pointed at it and pick up full context: hardware identity, KWin baseline, what to do, where to write commits if needed. | ✓ |
+| 17:12 | Pendrive prep handed off to Mahmud (KDE Startup Disk Creator). v0.3-experiment work pauses here until evidence is captured. | ⏸ pending |
+
+**On-USB instructions (TL;DR for the cheat sheet):**
+
+```bash
+sudo apt update && sudo apt install -y git jq openssh-server
+sudo ubuntu-drivers autoinstall
+sudo modprobe nvidia 2>/dev/null
+nvidia-smi || sudo systemctl restart gdm
+git clone https://github.com/mmhfarooque/zombie-event-log.git
+cd zombie-event-log && sudo bash install.sh && zel doctor
+sudo systemctl enable --now ssh && sudo passwd ubuntu && hostname -I
+# (SSH in from laptop, start: sudo journalctl -f -k > /tmp/cycle.log &)
+sleep 5 && systemctl suspend
+# wait 5 minutes, wake, observe screen, then on laptop SSH:
+zel last 5 && sudo cp -a /var/lib/zel/cycles /tmp/mutter-evidence/
+```
+
+**Pointer for live-USB Claude session:** `cat docs/EXPERIMENT-MUTTER-LIVE-USB.md` and `cat PROJECT_LOG.md` (this file) — together they cover the whole project context. The `git log` shows what's already shipped.
+
