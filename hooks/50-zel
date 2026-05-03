@@ -62,7 +62,7 @@ case "$phase" in
         cat > "$ZEL_CYCLES_DIR/$cycle_id.json" <<EOF
 {
   "cycle_id": "$cycle_id",
-  "schema_version": 1,
+  "schema_version": 2,
   "event_type": "$(json_escape "$event")",
   "suspend_at": "$suspend_iso",
   "suspend_at_epoch": $suspend_epoch,
@@ -89,7 +89,7 @@ EOF
             cat > "$ZEL_CYCLES_DIR/$cycle_id.json" <<EOF
 {
   "cycle_id": "$cycle_id",
-  "schema_version": 1,
+  "schema_version": 2,
   "event_type": "$(json_escape "$event")",
   "suspend_at": null,
   "suspend_at_epoch": null,

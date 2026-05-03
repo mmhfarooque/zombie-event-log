@@ -38,5 +38,10 @@ else
     rm -rfv /var/lib/zel
 fi
 
+# Per-user classifier caches live under each user's $XDG_CACHE_HOME and
+# can't be safely cleaned as root. Print a hint instead.
+echo "  · note: per-user classifier caches in ~/.cache/zel are NOT removed"
+echo "    (each user may run: rm -rf ~/.cache/zel)"
+
 echo
 echo "zel uninstalled."

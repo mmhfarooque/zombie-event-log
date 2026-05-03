@@ -135,3 +135,99 @@ zombie-event-log/
 └── tests/                                   (placeholder)
 ```
 
+### 2026-05-03 — Third real cycle + classifier-window discovery
+
+| Time | Step | Result |
+|---|---|---|
+| 14:00 | **Third real cycle captured (`20260503-135828`, 109s nap, locked=yes).** GSP fired (2 timeouts), KWin retried 3 atomic modesets, 0 framebuffer-incomplete, 4 drm-open failures, tail_gap=256. Outcome `rescued / medium` — confidence dropped from "high" because the post-storm tail gap fell below the 1000-line threshold (busy machine post-resume). | ✓ |
+| 14:30 | User asked whether `kwin_framebuffer_incomplete` and `kwin_scene_gl_errors` returning identical counts (42,636 = 42,636 in C2) indicated double-counting. Verified directly: ran both regexes against the journal — counts equal but `BOTH-on-same-line = 0`. Confirmed they're **separate log entries** that fire in lockstep (1:1 per failed render), not a double-count bug. KWin emits two journal records per broken frame: one for `GL_FRAMEBUFFER_INCOMPLETE_ATTACHMENT` from the FB stage, one for `kwin_scene_opengl GL_INVALID_OPERATION` from the scene loop. Classifier counts are correct; they describe the same underlying event from two angles. | ✓ |
+| 14:35 | **Discovered classifier slice undercounts catastrophic cycles.** `zel_journal_slice()` ends at `resume_at + 120s grace`. C2 storm extended **~19 minutes** past resume — the captured 42,636 events represent only the first 2 minutes; the next 17 minutes (17:12:37 → ~17:30) added another **19,122** framebuffer events, completely outside the classifier's window. Total real storm: 61,758 events sustained over ~19 minutes (~52 events/sec). The slice cuts off ~31% of catastrophic-cycle severity. Outcome verdict was still correct (rescued), but severity is under-reported. | ✓ |
+
+## Three-cycle comparison (as of 2026-05-03)
+
+| Field | C1 `20260502-151823` | **C2 `20260502-153242`** | C3 `20260503-135828` |
+|---|---|---|---|
+| Nap duration | 89s | **5,875s (98 min)** | 109s |
+| `gsp_heartbeat_timeouts` | 2 | **2** | 2 |
+| `drm_open_failures` | 8 | **6** | 4 |
+| `kwin_atomic_modeset_failures` | 10 | **9** | 3 |
+| `kwin_framebuffer_incomplete` | 21,990 | **42,636** *(+19,122 outside slice = 61,758 real)* | 0 |
+| `kwin_output_config_failed` | 4 | **3** | 0 |
+| `kwin_scene_gl_errors` | 21,990 | **42,636** *(+19,122 outside slice = 61,758 real)* | 0 |
+| `kwin_tail_gap_lines` | 48,449 | 92,881 | 256 |
+| `outcome` | rescued | **rescued** | rescued |
+| `outcome_confidence` | high | **high** | medium |
+
+**Refined headline:** GSP timeouts = constant (2 / 2 / 2 across all three) — bug is duration-independent. Storm severity scales with nap length: short naps (89s, 109s) → minor render storms; long nap (98 min) → 19-minute catastrophic render storm with 61k+ failed frames. **KWin rescued all three.** C2 is the hero data point for the article — show this one to demonstrate KWin's atomic-modeset retry loop surviving ~52 frame failures per second sustained over ~19 minutes.
+
+## Improvement targets identified (post-three-cycle review)
+
+These are concrete v0.2 fixes prompted by the three-cycle dataset, prioritised:
+
+1. **Adaptive journal slice** *(high priority — blocks accurate severity reporting on catastrophic cycles)*. Current `zel_journal_slice()` ends at `resume + 120s`. Should grow until the journal goes silent for N consecutive seconds (e.g. 30s of no compositor errors) or hard-cap at resume + 30 min. Persist `slice_end_epoch` into the cycle JSON so subsequent reads are reproducible.
+2. **Persist classifier output at capture time** *(high priority — journal rotation will erode old cycles)*. Today the classifier runs on demand against the live journal; once journal slices age out / vmcore rotates, old cycles become unverifiable. Write `<cycle_id>.classifier.json` alongside the metadata file at first read, then re-use it. Cycle JSON also gains a `classifier_run_at` field.
+3. **`storm_duration_seconds` derived signal**. First-failure-line-timestamp to last-failure-line-timestamp. More user-facing than raw counts; "19-minute render storm" reads better than "42,636 events". Pairs naturally with `nap_duration_seconds`.
+4. **`render_recovery_at` timestamp**. Timestamp of the last failure line + N silent seconds. Lets a user say "screen actually became usable at HH:MM:SS, N minutes after resume". Different from `resume_at` (kernel wake) and from `tail_gap` (line-based proxy).
+5. **`severity` bucket**. Derived: `mild` (< 1k render failures), `moderate` (1k–10k), `severe` (> 10k). Articles, GUI, and `zel stats` can summarise without exposing raw counts.
+6. **`gpu_render_failures` rollup**. KWin emits framebuffer + scene_gl pair per failed frame; expose `gpu_render_failures = max(framebuffer_incomplete, scene_gl_errors)` as the canonical count, keep the two raw signals for diagnostic detail. Mutter/muffin adapters get the same field name when implemented.
+7. **GSP recovery detector** *(NVIDIA-specific signal)*. Match `nvidia_gsp_recovery_at` from log lines indicating GSP came back ("nvidia: GPU resumed", "GSP RM IFR Boot completed", or similar). Brackets the bug duration precisely; useful for the example/article.
+8. **Classifier confidence: drop the `tail_gap > 1000` absolute floor in favour of a relative one**. C3 had only 256 clean lines after the storm because the system was busy post-resume — that's a clean rescue but the verdict said `medium`. Should use `tail_gap > N% of slice` only, with `N` calibrated against the three-cycle dataset.
+9. **Hook capture: store the systemd-sleep `event_type` distinction**. Currently always written as `suspend`; should reflect whether the trigger was suspend, hibernate, or hybrid-sleep so cross-event analysis works.
+10. **GUI: severity colour-coding in the cycle list**. With `severity` field landed, the left-pane list gets red/orange/green dots — at-a-glance triage.
+
+### Quick wins (can ship as v0.1.1 patches)
+- Items #6 (rollup field), #8 (confidence threshold), #9 (event_type) — small, no schema changes downstream.
+
+### Schema-changing (need v0.2 cut)
+- Items #1, #2, #3, #4, #5, #7 — touch the cycle JSON schema (bump `schema_version` to 2). Migration path: classifier reads schema_version and re-runs against journal for v1 cycles, fills in missing fields if journal still has the slice; otherwise marks fields `null` with `note=schema_v1_legacy`.
+
+### 2026-05-03 — v0.2 build session ("nothing to do this Sunday")
+
+User instruction: do all 10 v0.2 improvement items in one session.
+
+| Time | Step | Result |
+|---|---|---|
+| 16:00 | Fourth real cycle captured mid-build (`20260503-142615`) — 1h35m nap, GSP=2, drm_open=8 (highest yet), kwin_atomic_modeset=6, only 24 framebuffer events, storm_duration=0s. Rescued/high. New record for least-disruptive long nap. Captured fortuitously while we were rewriting the classifier — perfect end-to-end smoke. | ✓ |
+| 16:05 | **Item #9 done** — `hooks/50-zel` schema_version bumped 1→2 in both pre and post paths. Confirmed `event_type` was already correctly captured from systemd-sleep `$2`. | ✓ |
+| 16:15 | **Items #1, #2, #3, #4, #5, #7 — major core.sh rewrite (v0.2.0).** New constants `ZEL_SLICE_HARD_CAP_SECONDS=1800`, `ZEL_SLICE_SILENCE_SECONDS=30`, `ZEL_SLICE_INITIAL_GRACE=60`, `ZEL_SEVERITY_*_MIN`. `zel_journal_slice()` now pulls a wide 30-min window post-resume; storm end is derived from the data. New helpers `zel_journal_first_ts/last_ts`, `zel_severity_bucket`, `zel_classifier_file`, `zel_classify_persist`, `zel_classify_cached`, `zel_reclassify`. New signals emitted: `nvidia_gsp_first_timeout_at`, `nvidia_gsp_recovery_at`, `nvidia_gsp_wedge_seconds`, `gpu_render_failures`, `severity`, `storm_duration_seconds`, `render_recovery_at[_epoch]`, `storm_silence_seconds`, `slice_end_epoch`, `classifier_run_at[_epoch]`. | ✓ |
+| 16:18 | **Item #6 — `gpu_render_failures` rollup** added universally as `max(framebuffer_incomplete, scene_gl_errors)`. KWin emits both 1:1 paired per failed frame; max() is the right canonical count. Raw signals retained for diagnostics. | ✓ |
+| 16:20 | **Item #8 — confidence threshold rewritten universally.** Adapters now emit raw counts + first/last failure timestamps only; outcome/confidence is derived in `core.sh` from `storm_silence_seconds`. New rules: clean if zero errors, rescued/high if silence ≥ 60s, rescued/medium if 30–60s, catastrophic otherwise (high if silence < 5s, medium otherwise). Drops the v0.1 `tail_gap > 1000` absolute floor that misclassified C3's busy post-resume as `medium`. | ✓ |
+| 16:22 | KWin / mutter / muffin adapters refactored to v0.2 contract — emit `<compositor>_first_failure_at` / `<compositor>_last_failure_at` (raw "May DD HH:MM:SS" strings, parsable via `date -d`); kwin_tail_gap_lines kept as a diagnostic but no longer used for outcome. | ✓ |
+| 16:24 | Added `zel reclassify <id>` subcommand and registered it in `bin/zel`. | ✓ |
+| 16:26 | Fixed `bin/zel` ZEL_LIB_DIR resolver — was preferring system install over dev tree, blocking dev iteration. Now: env override > dev sibling > /usr/local > /usr/share. | ✓ |
+| 16:28 | First smoke against C2 (hero cycle) revealed PermissionDenied on `/var/lib/zel/cycles/<id>.classifier.json` — directory is root-owned (hook writes as root); CLI runs as user. | ✓ noted |
+| 16:30 | **Item #2 — moved classifier cache to `XDG_CACHE_HOME/zel/classifier/`** (per-user). `zel_classifier_file()` now mkdir's and returns under XDG cache. Per-user cache is fine because classifier output is reproducible from the journal. | ✓ |
+| 16:33 | **Re-smoke against all three cycles (C1=`20260502-153242`, C2=`20260503-135828`, C3=`20260503-142615`):** all clean. `zel show`, `zel last`, `zel stats`, `zel reclassify` all work. **Stats: 3 total, 3 rescued (100% rescue rate), 1 severe + 2 mild, 3/3 GSP firings.** | ✓ |
+| 16:36 | **Discovery from new wider slice on C1:** the v0.1 fixed window captured 42,636 framebuffer events; the v0.2 wide slice captures the FULL **61,758** (the 19,122 events that fell outside v0.1's `resume + 120s` window are now counted). Storm duration corrected: it's actually a **~3-minute** storm (172s), not the 19 minutes I'd estimated from the wider 17:30 cut-off — the storm ended at 17:13:30, after which the journal went silent. Hero cycle is even more impressive: ~344 frame failures per second sustained for 3 minutes, KWin recovered to a usable desktop. | ✓ insight |
+| 16:38 | Universal nvidia_gsp_wedge_seconds = 1 across all 3 cycles. Kernel re-inits GPU in 1 second; what we previously called "long zombie storm" is the COMPOSITOR's reconciliation time, not GPU wedge time. Two-stage recovery model now visible: kernel-level (GSP, ~1s) and compositor-level (KWin, 0–172s). | ✓ insight |
+| 16:42 | **Item #10 — GUI severity dots in `bin/zel-gui`.** Red / orange / green Pango-markup bullets keyed off the severity field. Footer summary line: "N cycles · X% rescue · severe N · moderate N · mild N". Bumped APP_VERSION to 0.2.0. Added per-user cache support and stale-cache cleanup on Clear-Logs. List rows pre-populated from cache (no journalctl per row). Smoke test: `python3 -m py_compile` clean; `timeout 4 ./bin/zel-gui` opens window without traceback. | ✓ |
+| 16:45 | uninstall.sh: added a notice that per-user XDG caches at `~/.cache/zel/` aren't removed (root can't safely touch user homes); each user can run `rm -rf ~/.cache/zel`. | ✓ |
+| 16:48 | README.md: new "What's new in v0.2" section, classifier cache row in components table, `zel reclassify` documented, roadmap entry flipped to "done". | ✓ |
+| 16:50 | Final smoke: all shell + python files syntax-clean, `zel version` shows `0.2.0`, `zel last`/`stats` show severity column + summary, `zel reclassify` overwrites cache cleanly. | ✓ |
+
+### v0.2 schema (cycle.json) — additions over v0.1
+
+```diff
+  "schema_version": 1   →   "schema_version": 2
+```
+
+(Cycle JSON keeps the same metadata fields. New fields live in the **classifier output** which is now persisted separately at `~/.cache/zel/classifier/<id>.classifier.json` rather than mixed into cycle.json. Keeps the hook trivial and the metadata stable.)
+
+### v0.2 classifier output — full field inventory
+
+```
+schema_version, compositor, slice_end_epoch
+gsp_heartbeat_timeouts, drm_open_failures
+nvidia_gsp_first_timeout_at[_epoch], nvidia_gsp_recovery_at[_epoch], nvidia_gsp_wedge_seconds
+<compositor>_* raw counts (e.g. kwin_atomic_modeset_failures, kwin_framebuffer_incomplete, ...)
+<compositor>_first_failure_at, <compositor>_last_failure_at
+gpu_render_failures, severity
+storm_duration_seconds, render_recovery_at[_epoch], storm_silence_seconds
+outcome, outcome_confidence
+classifier_run_at[_epoch]
+```
+
+### Migration: v1 cycle JSONs
+
+v1 cycle.json files (the three captured 2026-05-02 / 2026-05-03 with `schema_version: 1`) work unmodified — `zel show` re-runs the classifier and writes a v2 classifier.json into the cache. Field availability depends on whether the journal still has the slice (systemd journals rotate on disk pressure or `journalctl --vacuum-time`). Old v1 cycles continue to be classifiable as long as their journal slice is reachable.
+

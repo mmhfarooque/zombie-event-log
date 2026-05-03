@@ -31,10 +31,11 @@ zel doctor
 ## Usage
 
 ```bash
-zel stats                # summary across all cycles
-zel last 10              # last 10 cycles, table view
+zel stats                # summary across all cycles (with severity breakdown)
+zel last 10              # last 10 cycles, table view (compositor / outcome / severity / GSP)
 zel catastrophic         # cycles where the compositor did not recover
 zel show 20260502-145503 # full evidence dump for one cycle
+zel reclassify 20260502-145503  # re-run classifier and refresh the cache
 zel compare A B          # side-by-side classifier output
 zel export out.jsonl     # all cycles as JSONL for further analysis
 ```
@@ -46,9 +47,10 @@ After installing, suspend and resume your machine once. Then `zel last` will sho
 | Component | Path | Role |
 |---|---|---|
 | Hook | `/usr/lib/systemd/system-sleep/50-zel` | Runs on every suspend (pre) and resume (post). Records cycle metadata to `/var/lib/zel/cycles/<id>.json`. Exits in milliseconds. |
-| Cycles store | `/var/lib/zel/cycles/` | One JSON file per suspend/resume. ~2 KB each. |
+| Cycles store | `/var/lib/zel/cycles/` | One JSON file per suspend/resume. ~2 KB each. Schema v2 (v0.2.0+). |
 | CLI | `/usr/local/bin/zel` | Reads cycles, pulls journal slices on demand, runs the per-compositor adapter, prints results. |
 | Adapters | `/usr/local/share/zel/lib/adapters/` | Per-compositor classifiers (`kwin.sh`, `mutter.sh`, `muffin.sh`). |
+| Classifier cache | `~/.cache/zel/classifier/<id>.classifier.json` | Per-user reclassifier output. Persisted at first read so verdicts survive journal rotation. |
 
 Classification is **lazy** — done at query time, not in the hook — so re-runs benefit immediately when adapters improve, and the hook stays trivial.
 
@@ -79,9 +81,18 @@ See `docs/SUPPORTED-DESKTOPS.md` for what's missing and how to contribute an ada
 
 `zel` runs entirely on your machine. Nothing is uploaded anywhere. The cycle files live at `/var/lib/zel/cycles/` and you can inspect or delete them at any time.
 
+## What's new in v0.2
+
+- **Adaptive journal slice** — pulls a 30-minute window past resume and derives the actual storm end from the data, so severe cycles aren't truncated. v0.1's fixed `resume + 120s` slice under-reported a measured 19 % – 31 % on long-nap zombie storms.
+- **Persistent classifier cache** at `~/.cache/zel/classifier/<id>.classifier.json` — verdicts survive journal rotation, list views are instant after the first run.
+- **New derived signals**: `gpu_render_failures` (rollup of paired framebuffer/scene-GL counts), `severity` (mild / moderate / severe), `storm_duration_seconds`, `render_recovery_at`, `storm_silence_seconds`, `nvidia_gsp_first_timeout_at`, `nvidia_gsp_recovery_at`, `nvidia_gsp_wedge_seconds`.
+- **Universal outcome derivation** — KWin, mutter and muffin adapters now emit raw counts only; outcome and confidence are computed in `core.sh` from `storm_silence_seconds`. Cross-compositor comparisons are now apples-to-apples.
+- **GUI severity dots** — red / orange / green per row in `zel-gui`, plus footer summary (`severe N · moderate N · mild N · …% rescue`).
+- **Schema v2** — bumped `schema_version` in cycle JSON. v1 cycles are still readable; the classifier re-runs against the journal.
+
 ## Roadmap
 
-- **v0.2** — `zel-gui` (GTK4 + libadwaita): modern Linux desktop GUI for browsing, copying, and clearing logs
+- **v0.2** — done: `zel-gui` (GTK4 + libadwaita), adaptive slicing, persistent classifier cache, severity bucketing, NVIDIA GSP recovery detector
 - **v0.3** — first-class mutter adapter from real GNOME zombie ground truth
 - **v0.4** — `.deb`, `.rpm`, AUR `PKGBUILD`, **Flatpak** packaging
 - **v0.5** — TUI (`zel-tui`) for live browsing

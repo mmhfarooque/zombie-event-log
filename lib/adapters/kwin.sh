@@ -3,9 +3,13 @@
 # Signal model (validated against KDE Plasma 6 on Wayland with NVIDIA 595.58.03-open):
 #   - "Atomic modeset test failed!" repeats while DRM is dead. KWin retries.
 #   - "GL_FRAMEBUFFER_INCOMPLETE_ATTACHMENT" cascade in kwin_scene_opengl.
-#   - Recovery signal: a successful render after the failure storm — easiest proxy
-#     is the *last* "Atomic modeset test failed!" appearing well before the journal
-#     ends, with no further ones in the tail.
+#   - "kwin_scene_opengl ... GL_INVALID_OPERATION" pairs with the framebuffer
+#     line 1:1 — same render attempt logged from FB stage and scene loop.
+#
+# v0.2: outcome/confidence is now derived in core.sh from `storm_silence_seconds`
+# (universal). The adapter only emits raw counts and the first/last failure
+# timestamps so the universal layer can compute storm_duration_seconds /
+# render_recovery_at / outcome consistently across compositors.
 
 zel_adapter_kwin() {
     local journal="$1"
@@ -21,64 +25,26 @@ zel_adapter_kwin() {
     echo "kwin_output_config_failed=$output_failed"
     echo "kwin_scene_gl_errors=$scene_errors"
 
-    # Heuristic outcome:
-    #   clean         — no failures recorded
-    #   rescued       — failures present, but a clear gap between the last failure
-    #                   and the end of the journal slice (compositor recovered)
-    #   catastrophic  — failures present and ongoing into the tail of the slice
-    if [ "$atomic_fail" -eq 0 ] && [ "$fb_incomplete" -eq 0 ] && [ "$output_failed" -eq 0 ]; then
-        echo "outcome=clean"
-        echo "outcome_confidence=high"
-        return
-    fi
+    # First and last failure timestamps — used by core.sh to derive
+    # storm_duration_seconds and render_recovery_at.
+    # Pattern unions all KWin-specific failure signatures so we capture the
+    # full storm window, not just atomic-modeset retries.
+    local kwin_pat="Atomic modeset test failed|GL_FRAMEBUFFER_INCOMPLETE_ATTACHMENT|Applying output configuration failed|kwin_scene_opengl.*GL_INVALID_OPERATION"
+    local first_ts last_ts
+    first_ts=$(echo "$journal" | grep -E "$kwin_pat" | head -1 | awk '{print $1, $2, $3}')
+    last_ts=$(echo "$journal"  | grep -E "$kwin_pat" | tail -1 | awk '{print $1, $2, $3}')
+    [ -n "$first_ts" ] && echo "kwin_first_failure_at=$first_ts"
+    [ -n "$last_ts" ]  && echo "kwin_last_failure_at=$last_ts"
 
-    # The cardinal failure signal is "Atomic modeset test failed!" — when KWin
-    # stops emitting that, recovery has happened. The framebuffer/scene errors
-    # are downstream symptoms of the modeset state and cluster around it, so
-    # they're useful for counts but not for "when did the storm end".
-    local last_fail_line
-    last_fail_line=$(echo "$journal" | grep -n "Atomic modeset test failed" | tail -1 | cut -d: -f1)
-    local total_lines
+    # tail_gap_lines: kept as a diagnostic signal but no longer used for
+    # outcome/confidence — universal `storm_silence_seconds` (time-based) is
+    # the canonical rescue evidence in v0.2. Useful when comparing v0.1 vs
+    # v0.2 verdicts on the same cycle.
+    local last_fail_line total_lines tail_gap=0
+    last_fail_line=$(echo "$journal" | grep -nE "$kwin_pat" | tail -1 | cut -d: -f1)
     total_lines=$(echo "$journal" | wc -l)
-
-    if [ -z "$last_fail_line" ] || [ -z "$total_lines" ] || [ "$total_lines" -eq 0 ]; then
-        echo "outcome=catastrophic"
-        echo "outcome_confidence=low"
-        return
+    if [ -n "$last_fail_line" ] && [ -n "$total_lines" ] && [ "$total_lines" -gt 0 ]; then
+        tail_gap=$((total_lines - last_fail_line))
     fi
-
-    local tail_gap=$((total_lines - last_fail_line))
     echo "kwin_tail_gap_lines=$tail_gap"
-
-    # Confidence ladder based on how unambiguous the rescue evidence is.
-    #
-    #   high     — gap > 1000 lines AND > 25% of slice. Compositor clearly
-    #              ran cleanly for a long time after the storm.
-    #   medium   — gap > 25% of slice but small in absolute terms (short
-    #              journal slice, brief recovery period).
-    #   low      — gap exists but is tiny (rescue uncertain, edge case).
-    #
-    # Catastrophic mirror:
-    #   high     — failures span into the final 5% of the slice.
-    #   medium   — failures into final 25% but not the very tail.
-    local quarter=$((total_lines / 4))
-    [ "$quarter" -lt 50 ] && quarter=50
-    local last_5pct=$((total_lines / 20))
-    [ "$last_5pct" -lt 20 ] && last_5pct=20
-
-    if [ "$tail_gap" -gt "$quarter" ]; then
-        echo "outcome=rescued"
-        if [ "$tail_gap" -gt 1000 ]; then
-            echo "outcome_confidence=high"
-        else
-            echo "outcome_confidence=medium"
-        fi
-    else
-        echo "outcome=catastrophic"
-        if [ "$tail_gap" -lt "$last_5pct" ]; then
-            echo "outcome_confidence=high"
-        else
-            echo "outcome_confidence=medium"
-        fi
-    fi
 }

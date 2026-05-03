@@ -4,13 +4,26 @@
 
 set -u
 
-# Locate the lib dir. System install first, dev fallback second.
-if [ -d /usr/local/share/zel/lib ]; then
-    ZEL_LIB_DIR=/usr/local/share/zel/lib
-elif [ -d /usr/share/zel/lib ]; then
-    ZEL_LIB_DIR=/usr/share/zel/lib
+# Locate the lib dir.
+# Order:
+#   1. ZEL_LIB_DIR env override (test/CI use)
+#   2. dev tree relative to this script (running from a checkout)
+#   3. system install paths
+# This way `./bin/zel` from a dev checkout uses dev libs even if /usr/local
+# has an older installed copy.
+if [ -n "${ZEL_LIB_DIR:-}" ] && [ -f "${ZEL_LIB_DIR}/core.sh" ]; then
+    :   # use the override
 else
-    ZEL_LIB_DIR="$(cd "$(dirname "$(readlink -f "$0")")/../lib" 2>/dev/null && pwd)"
+    _zel_script_dir="$(cd "$(dirname "$(readlink -f "$0")")" 2>/dev/null && pwd)"
+    _zel_dev_lib="${_zel_script_dir}/../lib"
+    if [ -f "${_zel_dev_lib}/core.sh" ]; then
+        ZEL_LIB_DIR="$(cd "${_zel_dev_lib}" && pwd)"
+    elif [ -d /usr/local/share/zel/lib ]; then
+        ZEL_LIB_DIR=/usr/local/share/zel/lib
+    elif [ -d /usr/share/zel/lib ]; then
+        ZEL_LIB_DIR=/usr/share/zel/lib
+    fi
+    unset _zel_script_dir _zel_dev_lib
 fi
 export ZEL_LIB_DIR
 
@@ -31,6 +44,7 @@ case "$cmd" in
     catastrophic) zel_catastrophic "$@" ;;
     list)         zel_list "$@" ;;
     show)         zel_show "$@" ;;
+    reclassify)   zel_reclassify "$@" ;;
     compare)      zel_compare "$@" ;;
     export)       zel_export "$@" ;;
     doctor)       zel_doctor "$@" ;;

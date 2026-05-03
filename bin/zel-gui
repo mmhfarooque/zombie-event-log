@@ -21,11 +21,34 @@ from gi.repository import Adw, Gdk, GLib, Gio, GObject, Gtk  # noqa: E402
 
 
 APP_ID = "net.farooque.ZombieEventLog"
-APP_VERSION = "0.1.0"
+APP_VERSION = "0.2.0"
 
 DATA_DIR = Path(os.environ.get("ZEL_DATA_DIR", "/var/lib/zel"))
 CYCLES_DIR = DATA_DIR / "cycles"
+CACHE_DIR = Path(
+    os.environ.get(
+        "ZEL_CACHE_DIR",
+        os.environ.get("XDG_CACHE_HOME", str(Path.home() / ".cache")) + "/zel/classifier",
+    )
+)
 ZEL_BIN = shutil.which("zel") or "/usr/local/bin/zel"
+
+# Severity → (Pango colour, glyph). Glyphs render as solid bullets in the
+# default Adwaita font; colours follow Bootstrap-ish status palette and are
+# legible on both light and dark themes.
+SEVERITY_PALETTE = {
+    "severe":   ("#dc3545", "●"),
+    "moderate": ("#fd7e14", "●"),
+    "mild":     ("#198754", "●"),
+}
+UNKNOWN_GLYPH = ("#6c757d", "○")
+
+# Outcome → glyph used in the subtitle line.
+OUTCOME_LABEL = {
+    "rescued":      "✔ rescued",
+    "catastrophic": "✘ catastrophic",
+    "clean":        "· clean",
+}
 
 
 def run_zel(args, capture=True):
@@ -33,7 +56,7 @@ def run_zel(args, capture=True):
     try:
         cmd = [ZEL_BIN, *args]
         proc = subprocess.run(
-            cmd, capture_output=capture, text=True, timeout=30, check=False
+            cmd, capture_output=capture, text=True, timeout=120, check=False
         )
         return proc.returncode, proc.stdout, proc.stderr
     except FileNotFoundError:
@@ -42,12 +65,28 @@ def run_zel(args, capture=True):
         return 124, "", "zel command timed out"
 
 
+def read_classifier_cache(cycle_id):
+    """Return the cached classifier.json dict or None if absent/unreadable."""
+    path = CACHE_DIR / f"{cycle_id}.classifier.json"
+    if not path.is_file():
+        return None
+    try:
+        with path.open() as fh:
+            return json.load(fh)
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
 def list_cycles():
     """Read cycle JSON files directly for fast list rendering."""
     if not CYCLES_DIR.is_dir():
         return []
     cycles = []
     for path in sorted(CYCLES_DIR.glob("*.json"), reverse=True):
+        # Skip stray .classifier.json from old v0.2-dev installs that wrote
+        # cache into /var/lib/zel/cycles before we moved it to XDG_CACHE_HOME.
+        if path.name.endswith(".classifier.json"):
+            continue
         try:
             with path.open() as fh:
                 data = json.load(fh)
@@ -57,14 +96,16 @@ def list_cycles():
     return cycles
 
 
-def parse_classifier_output(text):
-    """Parse key=value lines into a dict."""
-    out = {}
-    for line in text.splitlines():
-        if "=" in line:
-            k, v = line.split("=", 1)
-            out[k.strip()] = v.strip()
-    return out
+def severity_markup(severity):
+    color, glyph = SEVERITY_PALETTE.get(severity, UNKNOWN_GLYPH)
+    return f'<span size="x-large" color="{color}">{glyph}</span>'
+
+
+def outcome_label(outcome, confidence=None):
+    base = OUTCOME_LABEL.get(outcome, outcome or "?")
+    if confidence and outcome in ("rescued", "catastrophic"):
+        return f"{base} ({confidence})"
+    return base
 
 
 class ZelWindow(Adw.ApplicationWindow):
@@ -118,7 +159,7 @@ class ZelWindow(Adw.ApplicationWindow):
 
         # Two-pane split: cycle list | detail
         paned = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL)
-        paned.set_position(380)
+        paned.set_position(420)
         paned.set_vexpand(True)
         root.append(paned)
 
@@ -130,7 +171,6 @@ class ZelWindow(Adw.ApplicationWindow):
         self.list_store = Gio.ListStore.new(CycleItem)
         self.selection = Gtk.SingleSelection.new(self.list_store)
         self.selection.set_can_unselect(False)
-        # notify::selected fires reliably on click; selection-changed is for batched changes
         self.selection.connect("notify::selected", self.on_selection_changed)
 
         factory = Gtk.SignalListItemFactory()
@@ -139,7 +179,6 @@ class ZelWindow(Adw.ApplicationWindow):
 
         self.list_view = Gtk.ListView.new(self.selection, factory)
         self.list_view.add_css_class("navigation-sidebar")
-        # ListView::activate fires on double-click / Enter — same handler
         self.list_view.connect("activate", self.on_row_activate)
         list_scroller.set_child(self.list_view)
 
@@ -186,28 +225,46 @@ class ZelWindow(Adw.ApplicationWindow):
 
     # ---------- list factory ----------
     def _row_setup(self, _factory, list_item):
-        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
-        box.set_margin_top(8)
-        box.set_margin_bottom(8)
-        box.set_margin_start(12)
-        box.set_margin_end(12)
+        # Horizontal: severity dot + (title/subtitle vertical box)
+        row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        row.set_margin_top(8)
+        row.set_margin_bottom(8)
+        row.set_margin_start(12)
+        row.set_margin_end(12)
+
+        dot = Gtk.Label()
+        dot.set_use_markup(True)
+        dot.set_valign(Gtk.Align.CENTER)
+        dot.set_width_chars(2)
+        row.append(dot)
+
+        text_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        text_box.set_hexpand(True)
         title = Gtk.Label(xalign=0)
         title.add_css_class("heading")
         subtitle = Gtk.Label(xalign=0)
         subtitle.add_css_class("caption")
         subtitle.add_css_class("dim-label")
-        box.append(title)
-        box.append(subtitle)
-        list_item.set_child(box)
+        text_box.append(title)
+        text_box.append(subtitle)
+        row.append(text_box)
+
+        list_item.set_child(row)
+        list_item._dot = dot
         list_item._title = title
         list_item._subtitle = subtitle
 
     def _row_bind(self, _factory, list_item):
         item = list_item.get_item()
+        list_item._dot.set_markup(severity_markup(item.severity))
         list_item._title.set_text(item.cycle_id)
-        list_item._subtitle.set_text(
-            f"{item.compositor} · locked={item.locked} · GSP={item.gsp_count}"
-        )
+        bits = [item.compositor]
+        if item.outcome:
+            bits.append(outcome_label(item.outcome, item.confidence))
+        if item.severity:
+            bits.append(item.severity)
+        bits.append(f"GSP={item.gsp_count}")
+        list_item._subtitle.set_text(" · ".join(bits))
 
     # ---------- actions ----------
     def refresh(self):
@@ -215,9 +272,32 @@ class ZelWindow(Adw.ApplicationWindow):
         self.list_store.remove_all()
         for c in cycles:
             self.list_store.append(CycleItem.from_dict(c))
+        # Stats summary in the footer
+        sev_counts = {"severe": 0, "moderate": 0, "mild": 0}
+        rescued = catastrophic = clean = unknown = 0
+        for c in cycles:
+            cls = read_classifier_cache(c.get("cycle_id", ""))
+            if not cls:
+                continue
+            sev = cls.get("severity")
+            if sev in sev_counts:
+                sev_counts[sev] += 1
+            outcome = cls.get("outcome")
+            if outcome == "rescued":
+                rescued += 1
+            elif outcome == "catastrophic":
+                catastrophic += 1
+            elif outcome == "clean":
+                clean += 1
+            else:
+                unknown += 1
+        denom = rescued + catastrophic
+        rate = f"{(rescued * 100 // denom)}% rescue" if denom else "—"
+        sev_summary = f"severe {sev_counts['severe']} · moderate {sev_counts['moderate']} · mild {sev_counts['mild']}"
         self.status_label.set_text(
-            f"{len(cycles)} cycles  ·  data: {CYCLES_DIR}"
+            f"{len(cycles)} cycles  ·  {rate}  ·  {sev_summary}  ·  data: {CYCLES_DIR}"
         )
+
         if not cycles:
             self.show_banner(
                 "No cycles recorded yet — install zel and suspend/resume once.",
@@ -261,6 +341,23 @@ class ZelWindow(Adw.ApplicationWindow):
         rc, out, err = run_zel(["show", cid])
         text = out if rc == 0 else f"(error running `zel show {cid}`)\n\n{err or '(no stderr)'}"
         self.detail_buffer.set_text(text)
+        # Refresh the row's severity/outcome from the cache that `zel show` just
+        # wrote — so the dot updates colour without a full reload.
+        self._refresh_item_classifier(cid)
+
+    def _refresh_item_classifier(self, cycle_id):
+        cls = read_classifier_cache(cycle_id)
+        if not cls:
+            return
+        for i in range(self.list_store.get_n_items()):
+            it = self.list_store.get_item(i)
+            if it.cycle_id == cycle_id:
+                it.update_from_classifier(cls)
+                # Force the row to rebind by emitting items_changed for that index.
+                self.list_store.items_changed(i, 1, 1)
+                # Re-append in place: the model's items_changed with same count
+                # is enough to trigger _row_bind on the visible row.
+                break
 
     def on_copy_selected(self, _btn):
         cid = self.get_selected_cycle()
@@ -314,6 +411,13 @@ class ZelWindow(Adw.ApplicationWindow):
         ]
         proc = subprocess.run(cmd, capture_output=True, text=True)
         if proc.returncode == 0:
+            # Wipe per-user classifier cache too — it's stale once the source
+            # cycle JSONs are gone.
+            try:
+                for f in CACHE_DIR.glob("*.classifier.json"):
+                    f.unlink(missing_ok=True)
+            except OSError:
+                pass
             self.toast("Logs cleared")
             self.refresh()
         else:
@@ -338,24 +442,39 @@ class ZelWindow(Adw.ApplicationWindow):
 class CycleItem(GObject.Object):
     __gtype_name__ = "CycleItem"
 
-    def __init__(self, cycle_id, compositor, locked, gsp_count):
+    def __init__(self, cycle_id, compositor, locked, gsp_count,
+                 severity=None, outcome=None, confidence=None):
         super().__init__()
         self.cycle_id = cycle_id
         self.compositor = compositor
         self.locked = locked
         self.gsp_count = gsp_count
+        self.severity = severity
+        self.outcome = outcome
+        self.confidence = confidence
 
     @classmethod
     def from_dict(cls, d):
-        # GSP count is computed lazily by `zel show`; for the list view we
-        # show the recorded compositor + lock state and leave GSP="?" until
-        # the user clicks the row (cheap; avoids running journalctl per row).
+        # Pre-populate severity / outcome from the persisted classifier cache
+        # if available — keeps the list cheap (no journalctl per row), and
+        # falls back gracefully when the cache hasn't been built yet.
+        cycle_id = d.get("cycle_id", "?")
+        cached = read_classifier_cache(cycle_id) or {}
         return cls(
-            cycle_id=d.get("cycle_id", "?"),
+            cycle_id=cycle_id,
             compositor=d.get("compositor", "?"),
             locked=d.get("locked_at_suspend", "?"),
-            gsp_count="?",
+            gsp_count=cached.get("gsp_heartbeat_timeouts", "?"),
+            severity=cached.get("severity"),
+            outcome=cached.get("outcome"),
+            confidence=cached.get("outcome_confidence"),
         )
+
+    def update_from_classifier(self, cls):
+        self.gsp_count = cls.get("gsp_heartbeat_timeouts", self.gsp_count)
+        self.severity = cls.get("severity", self.severity)
+        self.outcome = cls.get("outcome", self.outcome)
+        self.confidence = cls.get("outcome_confidence", self.confidence)
 
 
 class ZelApp(Adw.Application):
