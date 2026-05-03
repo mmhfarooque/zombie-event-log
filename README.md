@@ -81,6 +81,17 @@ See `docs/SUPPORTED-DESKTOPS.md` for what's missing and how to contribute an ada
 
 `zel` runs entirely on your machine. Nothing is uploaded anywhere. The cycle files live at `/var/lib/zel/cycles/` and you can inspect or delete them at any time.
 
+## Testing on GNOME (mutter) via Live USB
+
+Booting a Ubuntu Desktop Live USB and want to capture a mutter zombie cycle on the same hardware? See [`docs/EXPERIMENT-MUTTER-LIVE-USB.md`](docs/EXPERIMENT-MUTTER-LIVE-USB.md). One-shot bootstrap:
+
+```bash
+sudo apt install -y git && git clone https://github.com/mmhfarooque/zombie-event-log.git
+cd zombie-event-log && sudo bash scripts/live-usb-setup.sh
+```
+
+That script: installs the NVIDIA driver via `ubuntu-drivers`, installs zel, enables SSH (so a laptop can capture from outside), runs `zel doctor`, and prints the LAN IPs. Then trigger `systemctl suspend` and observe.
+
 ## What's new in v0.2
 
 - **Adaptive journal slice** — pulls a 30-minute window past resume and derives the actual storm end from the data, so severe cycles aren't truncated. v0.1's fixed `resume + 120s` slice under-reported a measured 19 % – 31 % on long-nap zombie storms.

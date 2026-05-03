@@ -20,6 +20,21 @@ Use this when you've booted Ubuntu Desktop from a live USB on the same hardware 
 
 Run everything below from a terminal **on the live USB session** unless tagged `[laptop]`.
 
+## 0. Fast path — one-shot bootstrap
+
+If you'd rather skip Sections 1–4 and jump straight to "trigger the cycle", use the bootstrap script:
+
+```bash
+sudo apt install -y git
+git clone https://github.com/mmhfarooque/zombie-event-log.git
+cd zombie-event-log
+sudo bash scripts/live-usb-setup.sh
+```
+
+This runs every step from "1. Verify the live session" through "4. Set up SSH" in one go. After it finishes, jump to Section 5 (Trigger the cycle).
+
+The sections below remain the source of truth if you want to do it step by step or debug a step that the bootstrap skipped.
+
 ## 1. Verify the live session
 
 ```bash
