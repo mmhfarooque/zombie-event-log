@@ -122,13 +122,54 @@ zel_classify() {
     # Universal kernel-level signals
     local gsp_count drm_open_fail
     gsp_count=$(echo "$journal" | grep -c "_kgspIsHeartbeatTimedOut\|GSP RM heartbeat timed out" || true)
-    drm_open_fail=$(echo "$journal" | grep -c "Failed to open drm device\|Failed to open /dev/dri" || true)
+    # Exclude the benign card0 probe — kwin/sddm tries to open /dev/dri/card0
+    # (the simple-framebuffer boot console, not a render node) on every login
+    # and resume on a hybrid-GPU box; it always fails and is not a real error.
+    drm_open_fail=$(echo "$journal" | grep -E "Failed to open drm device|Failed to open /dev/dri" | grep -vcE "card0" || true)
 
     echo "schema_version=$ZEL_SCHEMA_VERSION"
     echo "compositor=$compositor"
     echo "slice_end_epoch=$slice_end_ep"
     echo "gsp_heartbeat_timeouts=$gsp_count"
     echo "drm_open_failures=$drm_open_fail"
+
+    # Userspace GPU/GL context collapse — the open-module post-resume failure
+    # mode: NVIDIA VRAM-restore silently fails, the kernel logs no Xid, but GL
+    # clients die. Chromium/Electron GPU process exits, GL context creation
+    # failures, command-buffer proxy failures. Invisible to the adapter-only
+    # signals because the compositor render loop can stay quiet.
+    local gpu_userspace_collapse compositor_graphics_reset
+    gpu_userspace_collapse=$(echo "$journal" | grep -cE "GPU process exited unexpectedly|GPU state invalid after|CreateCommandBuffer|gl::init::CreateGLContext failed|CollectGraphicsInfo failed|Exiting GPU process due to errors during initialization" || true)
+    echo "gpu_userspace_collapse=$gpu_userspace_collapse"
+
+    # Compositor self-rescue attempt — KWin/mutter re-init after a GL reset.
+    compositor_graphics_reset=$(echo "$journal" | grep -cE "graphics reset|Desktop effects were restarted|Reinitializing OpenGL" || true)
+    echo "compositor_graphics_reset=$compositor_graphics_reset"
+
+    # Boot-end correlation — did the boot this cycle lives in die uncleanly
+    # (hard-reset zombie) with no successful wake afterwards? That is the
+    # definitive post-resume-collapse signal. Skip the still-running current
+    # boot, and skip boots whose journal has rotated away (cannot tell).
+    local boot_id this_boot cur_boot unclean_boot_end=0 boot_end_epoch="" later_wakes=0
+    boot_id=$(zel_field "$cycle_file" boot_id)
+    if [ -n "$boot_id" ] && [ "$boot_id" != "null" ]; then
+        cur_boot=$(tr -d '-' < /proc/sys/kernel/random/boot_id 2>/dev/null)
+        this_boot=$(echo "$boot_id" | tr -d '-')
+        local boot_lines
+        boot_lines=$(journalctl -b "$boot_id" -n 3 --no-pager 2>/dev/null | wc -l)
+        if [ -n "$this_boot" ] && [ "$this_boot" != "$cur_boot" ] && [ "${boot_lines:-0}" -gt 0 ]; then
+            local clean_markers
+            clean_markers=$(journalctl -b "$boot_id" -n 80 --no-pager 2>/dev/null | grep -ciE "Journal stopped|systemd-shutdown|Reached target.*(Power-Off|Reboot|Halt|Shutdown)" || true)
+            if [ "${clean_markers:-0}" -eq 0 ]; then
+                unclean_boot_end=1
+                boot_end_epoch=$(journalctl -b "$boot_id" -n 1 -o short-unix --no-pager 2>/dev/null | cut -d. -f1)
+                later_wakes=$(journalctl -b "$boot_id" --since "@$((resume_epoch + 60))" --no-pager 2>/dev/null | grep -ciE "Waking up from system sleep|PM: suspend exit" || true)
+            fi
+        fi
+    fi
+    echo "unclean_boot_end=$unclean_boot_end"
+    [ -n "$boot_end_epoch" ] && echo "boot_end_epoch=$boot_end_epoch"
+    echo "later_wakes_after_this=${later_wakes:-0}"
 
     # NVIDIA GSP recovery — `Finished nvidia-resume.service` after the heartbeat
     # timeout. Brackets the kernel-level GPU wedge duration (typically 1–2s
@@ -238,11 +279,37 @@ zel_classify() {
     #   storm_silence_seconds >= 30                           → rescued / medium
     #   storm_silence_seconds <  30                           → catastrophic
     #     confidence high if silence < 5, else medium
-    local any_kernel_error=$((gsp_count + drm_open_fail))
+    # drm_open_fail is dominated by benign kwin/sddm DRM-node probe failures
+    # (card*/renderD12* enumeration fallback) on this hybrid-GPU box and fires
+    # on clean cycles too, so it is informational only and does NOT gate the
+    # outcome. The GSP heartbeat timeout is the real kernel-level wedge signal.
+    local any_kernel_error=$((gsp_count))
     local outcome outcome_confidence
+
+    # Definitive zombie: this cycle's boot died uncleanly with no later wake.
+    local post_collapse=0
+    if [ "$unclean_boot_end" -eq 1 ] && [ "${later_wakes:-0}" -eq 0 ]; then
+        post_collapse=1
+    fi
+
     if [ "$compositor_known" -eq 0 ]; then
         outcome="unknown_compositor"
         outcome_confidence="low"
+    elif [ "$post_collapse" -eq 1 ]; then
+        # Boot ended in a hard-reset zombie and this was the last resume before
+        # it. The worst outcome — overrides the render/silence heuristics.
+        outcome="post_resume_collapse"
+        if [ "$gpu_userspace_collapse" -gt 0 ] || [ "$any_kernel_error" -gt 0 ] || [ "$gpu_render_failures" -gt 0 ]; then
+            outcome_confidence="high"
+        else
+            outcome_confidence="medium"
+        fi
+    elif [ "$gpu_userspace_collapse" -gt 0 ] && [ "$gpu_render_failures" -eq 0 ]; then
+        # Resume looked clean to the compositor, but userspace GL clients died —
+        # the silent VRAM-restore-failure mode. Survived this boot but degraded.
+        # This is the class the pre-v0.3 classifier mislabelled clean/rescued.
+        outcome="degraded"
+        outcome_confidence="high"
     elif [ "$gpu_render_failures" -eq 0 ] && [ "$any_kernel_error" -eq 0 ]; then
         outcome="clean"
         outcome_confidence="high"
@@ -423,7 +490,7 @@ zel_last() {
 
 zel_stats() {
     zel_check_data_dir
-    local total=0 clean=0 rescued=0 catastrophic=0 unknown=0 gsp_total=0
+    local total=0 clean=0 rescued=0 degraded=0 catastrophic=0 post_collapse=0 unknown=0 gsp_total=0
     local mild=0 moderate=0 severe=0
     local files
     files=$(ls -1 "$ZEL_CYCLES_DIR"/*.json 2>/dev/null | grep -v '\.classifier\.json$')
@@ -438,10 +505,12 @@ zel_stats() {
         severity=$(echo "$cls" | grep '^severity=' | head -1 | cut -d= -f2)
         gsp=$(echo "$cls"      | grep '^gsp_heartbeat_timeouts=' | cut -d= -f2)
         case "$outcome" in
-            clean)        clean=$((clean + 1)) ;;
-            rescued)      rescued=$((rescued + 1)) ;;
-            catastrophic) catastrophic=$((catastrophic + 1)) ;;
-            *)            unknown=$((unknown + 1)) ;;
+            clean)                clean=$((clean + 1)) ;;
+            rescued)              rescued=$((rescued + 1)) ;;
+            degraded)             degraded=$((degraded + 1)) ;;
+            catastrophic)         catastrophic=$((catastrophic + 1)) ;;
+            post_resume_collapse) post_collapse=$((post_collapse + 1)) ;;
+            *)                    unknown=$((unknown + 1)) ;;
         esac
         case "$severity" in
             mild)     mild=$((mild + 1)) ;;
@@ -456,13 +525,17 @@ zel_stats() {
     printf '  total cycles:        %d\n' "$total"
     printf '  clean (no GSP/error): %d\n' "$clean"
     printf '  rescued by compositor: %d\n' "$rescued"
+    printf '  degraded (survived, GL collapse): %d\n' "$degraded"
     printf '  catastrophic:        %d\n' "$catastrophic"
+    printf '  post-resume collapse (zombie): %d\n' "$post_collapse"
     printf '  unclassified:        %d\n' "$unknown"
     printf '  cycles with GSP:     %d\n' "$gsp_total"
-    if [ "$rescued" -gt 0 ] || [ "$catastrophic" -gt 0 ]; then
-        local denom=$((rescued + catastrophic))
-        local pct=$((rescued * 100 / denom))
-        printf '  rescue rate:         %d%% (%d of %d non-clean cycles)\n' "$pct" "$rescued" "$denom"
+    local nonclean=$((rescued + degraded + catastrophic + post_collapse))
+    if [ "$nonclean" -gt 0 ]; then
+        local recovered=$((rescued + degraded))
+        local failed=$((catastrophic + post_collapse))
+        local pct=$((recovered * 100 / nonclean))
+        printf '  recovery rate:       %d%% (%d recovered, %d failed, of %d non-clean)\n' "$pct" "$recovered" "$failed" "$nonclean"
     fi
     echo
     printf '  severity — mild:     %d\n' "$mild"
@@ -479,7 +552,7 @@ zel_catastrophic() {
         local cls outcome
         cls=$(zel_classify_cached "$f")
         outcome=$(echo "$cls" | grep '^outcome=' | head -1 | cut -d= -f2)
-        if [ "$outcome" = "catastrophic" ]; then
+        if [ "$outcome" = "catastrophic" ] || [ "$outcome" = "post_resume_collapse" ]; then
             zel_field "$f" cycle_id
         fi
     done <<< "$files"

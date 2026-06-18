@@ -262,3 +262,18 @@ zel last 5 && sudo cp -a /var/lib/zel/cycles /tmp/mutter-evidence/
 
 **Pointer for live-USB Claude session:** `cat docs/EXPERIMENT-MUTTER-LIVE-USB.md` and `cat PROJECT_LOG.md` (this file) — together they cover the whole project context. The `git log` shows what's already shipped.
 
+
+### 2026-06-18 — v0.2.x classifier: post-resume-collapse detection
+
+Real-world driver: ms7e41 hard-reset zombie on 2026-06-18. Root cause traced to the NVIDIA open-module 595.71.05 + kernel 7.0 suspend regression (VRAM restore silently fails, no kernel Xid). The cycle that froze the machine (20260618-152350) was scored clean/high by the v0.2 classifier, because it only looked at GSP heartbeat + DRM-open at the resume instant and was blind to a userspace GL collapse that surfaces minutes after a clean-looking resume.
+
+| Time | Step | Result |
+|---|---|---|
+| 19:05 | Added universal signal gpu_userspace_collapse (Chromium/Electron GPU-process exits, GL context + command-buffer failures in the slice). | done |
+| 19:08 | Added compositor_graphics_reset (counts KWin/mutter GL re-init attempts as rescue-attempt evidence). | done |
+| 19:12 | Added boot-end correlation: map cycle boot_id to whether that boot ended uncleanly (no shutdown/reboot target, no journald stop) with no later wake = definitive zombie. Guards: skips the running boot and boots whose journal has rotated away. | done |
+| 19:16 | New outcomes degraded (survived but GL stack collapsed) and post_resume_collapse (boot died after this resume). Wired into stats + catastrophic list; recovery-rate metric reworked. | done |
+| 19:22 | Fixed pre-existing false positive: drm_open_failures was counting benign kwin/sddm probe failures of card0/card1/renderD12x (hybrid-GPU enumeration fallback that fires on clean cycles). Now informational only; GSP heartbeat gates the kernel-error verdict. | done |
+| 19:28 | Verified: 20260618-152350 reclassifies clean to post_resume_collapse/high (gpu_userspace_collapse=7, compositor_graphics_reset=1, unclean_boot_end=1). Full re-score: 45 clean / 82 rescued / 1 degraded / 2 post_resume_collapse / 130. | done |
+
+Lesson and next increment (v0.3 Phase 1): classification verdicts live only in the volatile per-user cache (~/.cache/zel), so clearing it after journals rotate loses history. During this session the 5 older catastrophic verdicts (late-May to early-June) could not be re-derived because their journals had aged out. Fix: persist verdict + signal counts durably into /var/lib/zel at capture time so rotation and cache clears can never erase history. Then build the failsafe ladder (notify, kwin --replace, session bounce, clean reboot instead of hard reset) behind an arm/disarm toggle.
