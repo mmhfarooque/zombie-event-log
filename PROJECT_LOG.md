@@ -2,9 +2,9 @@
 
 **Project:** `zombie-event-log` (CLI binary: `zel`)
 **Repo target:** `mmhfarooque/zombie-event-log` (GitHub, personal account `farooque7@gmail.com`)
-**Local path:** `/home/mahmud/app-dev/zombie-event-log/`
+**Local path:** `/home/USER/app-dev/zombie-event-log/`
 **Started:** 2026-05-02
-**Origin context:** spawned from the NVIDIA-GSP suspend/zombie investigation at `/home/mahmud/LinuxDev/nvidia-suspend-2026-04-30/`
+**Origin context:** spawned from the NVIDIA-GSP suspend/zombie investigation at `/home/USER/LinuxDev/nvidia-suspend-2026-04-30/`
 
 ## Why this exists
 
@@ -279,3 +279,136 @@ Real-world driver: ms7e41 hard-reset zombie on 2026-06-18. Root cause traced to 
 Lesson and next increment (v0.3 Phase 1): classification verdicts live only in the volatile per-user cache (~/.cache/zel), so clearing it after journals rotate loses history. During this session the 5 older catastrophic verdicts (late-May to early-June) could not be re-derived because their journals had aged out. Fix: persist verdict + signal counts durably into /var/lib/zel at capture time so rotation and cache clears can never erase history. Then build the failsafe ladder (notify, kwin --replace, session bounce, clean reboot instead of hard reset) behind an arm/disarm toggle.
 
 Shipped: committed as 152219a and pushed to mmhfarooque/zombie-event-log main (authored Mahmud Farooque <farooque7@gmail.com>, personal account). NOT yet live on ms7e41 — pending sudo bash install.sh to deploy the new lib into /usr/local/share/zel (safe; preserves /var/lib/zel cycle data). Separate ms7e41 machine fix, not part of this repo: NVIDIA open-module suspend param change (NVreg_UseKernelSuspendNotifiers=1, drop PreserveVideoMemoryAllocations=1) staged at /tmp/ms7e41-zombie-fix.sh, pending a reboot.
+
+### 2026-06-19 evening — live capture session: full failure-spectrum characterised, netconsole rig built, modprobe space ruled out
+
+Triggered by another KWin/Plasma death + hard restart. Spent the session driving `zel` + journals + a fresh network-capture rig against ms7e41 in real time. No code shipped to this repo; the value is diagnosis + a built (then torn-down) capture harness. Installed `zel` lib is now == repo (152219a install.sh ran at some point since 06-18; that prior "pending install" note is resolved).
+
+**Today's cycle tally (2026-06-19):**
+
+| Time | Trigger | Kernel | Userspace | Verdict |
+|---|---|---|---|---|
+| 12:53 | idle auto-suspend | resumed | plasmashell OK | clean |
+| 14:03 | idle auto-suspend | resumed | plasmashell OK | clean |
+| 17:59 | idle auto-suspend (PowerDevil) | **never woke** — journal ends at `PM: suspend entry (deep)`, no `suspend exit`, hard reset ~19:22 | — | **ZOMBIE** (deep-suspend resume hang) |
+| 19:33 | manual (live witness test) | resumed ~44s | — | clean |
+| 20:18 | manual (netconsole armed) | resumed | **plasmashell SIGABRT** | degraded |
+| 20:25 | manual (netconsole armed) | resumed | **plasmashell SIGABRT** | degraded |
+| ~20:40 | manual (disarmed, stock) | resumed | plasmashell OK | clean (control) |
+
+**Findings that closed off wrong leads:**
+1. **KWin `Permission denied` / `Atomic modeset test failed` / `drmModeListLessees() failed` on suspend = BENIGN.** They fire on every suspend incl. cycles that resume perfectly (proven on 12:53/14:03/19:33). NOT the crash. (Corrected an early misread that took them as the smoking gun.) Matches the existing `drm_open_failures`-is-informational classifier rule.
+2. **Duration-threshold theory FALSIFIED with the dataset.** Across 130 cycles: `20260615-074757` collapsed at **26 min** (post_resume_collapse) while `20260604-223520` resumed **clean at 392 min (6.5h)**. Of the 4 bad outcomes, 2 were under 1h, 2 over. Duration is neither necessary nor sufficient — it is a probabilistic resume race, not a timer.
+3. **RAM-reseat ruled out** — deterministic trigger (logind idle-suspend) + clean intermittency + known driver/kernel = software, not contacts.
+4. **Daughter power-button confound raised + cleared** — plasmashell crashes on untouched clean resumes.
+
+**The bug, fully characterised — one root, three severities:**
+- Root: GPU/VRAM + GL-context state not reliably restored across S3 suspend on this stack.
+- Mild: clean resume.
+- **Degraded (`gpu_userspace_collapse`):** on resume, plasmashell processes a Wayland expose, tries to rebuild its RHI, finds the GL context gone → `QRhiGles2: Context is lost` → `Failed to create RHI (backend 2)` → `Failed to initialize graphics backend for OpenGL` → Qt `qFatal()` → SIGABRT → KCrash → auto-respawn. Backtrace: `QWaylandWindow::sendExposeEvent` → `updateExposure` → QtQuick fatal. Modules: `libnvidia-egl-wayland`, `libEGL_mesa`, `libGLX`. Coredumps 20:19:30 + 20:26:29.
+- **Zombie:** full kernel resume hang (17:59), machine wedged, hard reset only recovery.
+
+**modprobe config space — now EXHAUSTED (fix is not a setting):**
+- `NVreg_PreserveVideoMemoryAllocations=1` is the **proprietary**-driver mechanism. On the open module it half-wires a procfs suspend path the open module does not expose and *matched* the delayed post-resume collapse (upstream open-gpu-kernel-modules issues 1142 / 1157). Removed 06-18. **Do NOT re-enable on the open module** — staging that was proposed this session and correctly aborted after reading the conf comment.
+- `NVreg_UseKernelSuspendNotifiers=1` is the open-module-correct mechanism, active now (`/proc/driver/nvidia/params` reads `PreserveVideoMemoryAllocations: 2`, `UseKernelSuspendNotifiers: 1`). Context loss persists *with it on*.
+- Both mechanisms tried → conclusion: a modprobe toggle will not fix this. Next levers are **path 2 (patch the open module)** or **path 3 (driver/kernel version bump)**.
+- Other relevant: `NVreg_TemporaryFilePath=/var` (VRAM save path — untested whether the save actually succeeds); 2nd file `nvidia-drm-fbdev-suspendfix.conf` exists, not yet read; `nvidia-suspend/resume/hibernate.service` all enabled.
+
+**netconsole capture rig — BUILT, PROVEN, then learned its hard limit:**
+- Receiver: rootless Python UDP listener on NAS (Synology DS923+, `<nas-user>@<NAS_IP_A>`, key `~/.ssh/nas-git`), port 6666, log at `/volume1/homes/<nas-user>/zel-netconsole.log`. NAS busybox lacks nc/socat/pgrep/ss — used Python + `/proc/net/udp` (port hex `1A0A`) + ssh-`cat` delivery (SFTP is chrooted, scp fails). No root on NAS (sudo denied) → cannot touch shares/backups by construction.
+- Sender: dynamic netconsole via configfs, 3 redundant targets — NAS NICs eth2/.96 `<NAS_MAC_A>` (2.5GbE static), eth1/.97 `<NAS_MAC_B>`, eth0/.98 `<NAS_MAC_C>`. PC iface `enp130s0` / `<PC_LAN_IP>`. Set `console_suspend=N` + `printk=8`.
+- Scripts: `~/DEV/nvidia-resume-fix/{nas-listener-v01.py, arm-netconsole-v01.sh, disarm-netconsole-v01.sh}`.
+- **PROVEN** end-to-end on clean cycles. **LIMITATION (key result):** ~7s resume **blind spot** — the NIC is down during the resume window when the killer GPU/DRM messages print, so netconsole alone CANNOT capture the zombie or the plasmashell context-loss. (plasmashell crash is userspace anyway → journald only, never netconsole.)
+- pstore: mounted but **no working backend** (no ERST table, no ramoops) → captures nothing; a silent hang has no oops to catch regardless.
+- NIC-independent options for the zombie: **serial console** (`/dev/ttyS0`,`ttyS1` exist — needs COM header + cable) or **kdump** (disk vmcore; needs crashkernel reboot) fronted by `hung_task_panic`/`softlockup_panic`/magic-sysrq to turn the silent wedge into a catchable panic.
+
+**OPEN QUESTION carried to next session — `console_suspend=N` correlation:**
+- Armed (`console_suspend=N`): 2/2 resumes crashed plasmashell. Disarmed (stock `console_suspend=Y`): 1/1 clean.
+- NOT conclusive: ~1-in-4 base crash rate means the single clean disarmed resume had ~75% chance of being luck. **Need ~5 disarmed resume samples** to confirm/deny. Hypothesis: keeping the console alive across suspend perturbs GPU resume timing and tips borderline resumes into context-loss. If true, that is a genuine finding (and a clue about the race).
+
+**Hardware/feasibility for path 2:** Core Ultra 5 245K (Arrow Lake-S) / MSI PRO B860-P / kernel 7.0.0-22 / hybrid Intel iGPU + RTX 3060 (GA106) / NVIDIA Open module 595.71.05 / KDE Wayland. Secure Boot ON but **MOK already enrolled + `kmodsign` present** → signing a self-built module is feasible. `open-gpu-kernel-modules` cloned at tag **595.71.05** in `~/DEV/nvidia-resume-fix/` (resume path: `kernel-open/nvidia/nv-pci.c` etc.), toolchain + headers present.
+
+**End-of-session state (all reverted to stock):** PC — netconsole unloaded, `console_suspend=Y`, modprobe conf UNCHANGED (still 06-18 config). NAS — listener killed (pid 5057, port free), capture log preserved (255 lines). No persistent prod changes.
+
+**Next session, in order:**
+1. Gather ~5 stock-config resume samples to settle the `console_suspend=N` question (just normal use; watch for the plasmashell crash dialog).
+2. If pain needs stopping meanwhile: `sudo systemctl mask sleep.target suspend.target hibernate.target hybrid-sleep.target` (one line, reversible) — the only thing that reliably stops the zombie too.
+3. Pick fix path: **2** (instrument/patch open module resume + VRAM-restore, sign w/ MOK) vs **3** (newer open-module tag / kernel that may already fix the resume race — check issues 1142/1157 status). Read `nvidia-drm-fbdev-suspendfix.conf` and verify the `/var` VRAM save actually succeeds first.
+4. Optional: kdump + panic-on-hang + sysrq, or serial console, to capture the full zombie (netconsole proven blind in the resume window).
+
+### 2026-06-19 late — path 2 opened: stock module BUILDS, preservation-setting class FALSIFIED, root localised to nvidia-drm sync + Qt
+
+Went the hard way on the open module. Two outcomes, both real.
+
+**Stock build WORKS (the path-2 gate):** `make -j modules` in `~/DEV/nvidia-resume-fix/open-gpu-kernel-modules` (tag 595.71.05) compiled all 5 modules clean against kernel 7.0.0-22 headers: `nvidia.ko` (36M), `nvidia-uvm.ko` (57M), `nvidia-modeset.ko`, `nvidia-drm.ko`, `nvidia-peermem.ko`. (BTF gen skipped — no vmlinux — harmless.) So we can build, and with the enrolled MOK + `kmodsign` we can sign and load a patched module. Build log: `open-gpu-kernel-modules/build.log`.
+
+**Root-cause hunt — the entire "preservation config" class is now falsified (traced in source, not guessed):**
+- `nv_dev_needs_vidmem_preservation()` (nv.h:1341) returns **true** for the RTX 3060 (only false for Tegra/SoC iGPU) → restore is NOT skipped.
+- No `WARN_ON` fired on either resume (20:19 / 20:26) → `nvidia_resume()` + `nv_restore_user_channels()` ran and returned NV_OK.
+- The param reads `2` because the open-module **default is AUTO** (`NV_DEFINE_REG_ENTRY(...AUTO)`, nv-reg.h:1049). Removing the explicit `=1` on 06-18 just fell back to AUTO.
+- AUTO path (osinit.c:955): `nv->preserve_vidmem_allocations = os_supports_kernel_suspend_notifiers()` and that returns `NVreg_UseKernelSuspendNotifiers==1` → **TRUE on this box**. So AUTO + notifiers → `memmgrSetPmaForcePersistence(TRUE)`. **Full VRAM preservation is already ENABLED, running, and reporting success.**
+- Conclusion: it is NOT a modprobe setting, NOT skipped restore, NOT RM-level VRAM loss. (`Preserve=1` would additionally trip the `!is_procfs_suspend` error at nv.c:4693 under the notifier path — that is the 06-18 zombie mechanism — so still do NOT set it.)
+
+**Where the evidence now points (next session targets):**
+1. **nvidia-drm sync layer** — the ONLY resume error was `[nvidia-drm] *ERROR* Failed to register auto-value-update on pre-wait value for sync FD semaphore surface` (GPU ID 0x200) at 20:18:35 + 20:26:15. A DRM fence/semaphore-surface object not surviving suspend *despite* VRAM preservation. Instrument `nvidia-drm` semaphore-surface restore (`__nv_drm_semsurf_wait_fence_work_cb` and its setup) — patchable, module builds.
+2. **Qt/plasma fragility** — Qt6 RHI hits `Context is lost` → `qFatal()` → abort instead of rebuilding the context. That half is upstream Qt/plasma, not NVIDIA; a lost context *should* be recoverable. Worth checking Qt RHI context-robustness handling / any plasma env knob.
+3. **Path 3 (version bump)** still a strong candidate — a newer open-module tag / kernel may fix the sync-surface restore. Cheaper than patching if it works; check open-gpu-kernel-modules changelog for sync FD / semaphore-surface suspend fixes after 595.71.05.
+
+State unchanged from prior entry (all stock; nothing installed; build artifacts are throwaway in the workspace).
+
+### 2026-06-19 night — DECISION: upgrade driver to 610.43.02 (path 3), build pre-validated, install staged (pending Secure Boot off)
+
+User at ultimatum (fix tonight or back to Windows). Chose the version bump and specifically the newest branch (v6 = 610.43.02).
+
+**Why path 3 not path 2:** Ubuntu is frozen at 595.71.05 (it is the newest in-repo; 580/575/570 are older). `apt` cannot upgrade. But upstream `open-gpu-kernel-modules` has newer tags: 595.80, 595.84, and **610.43.02**. A newer release is the genuine-fix shot (corrected upstream code, not a workaround) and far faster than hand-patching nvidia-drm sync-surface restore.
+
+**Pre-validation done (de-risk before touching BIOS):**
+- `610.43.02` open module **BUILDS CLEAN on kernel 7.0.0-22** — cloned to `~/DEV/nvidia-resume-fix/ogkm-610`, `make modules` produced all 5 `.ko`, only harmless objtool RETHUNK warnings, zero errors.
+- `.run` installers downloaded to `~/DEV/nvidia-resume-fix/`: `NVIDIA-Linux-x86_64-610.43.02.run` (440MB, primary) + `NVIDIA-Linux-x86_64-595.84.run` (403MB, safer same-branch fallback if 610 misbehaves at runtime).
+
+**Blocker that MUST be cleared first — Secure Boot:**
+- SB is **ENABLED** (confirmed twice: `mokutil --sb-state` = enabled; efivar `SecureBoot-...` data byte = 1). User wrongly believed it was off.
+- **MOK keystore `/var/lib/shim-signed/mok/` is EMPTY** — no user signing key. Current 595.71.05 module loads only because Canonical signed it. A `.run`/self-built 610 module would be **unsigned → blocked by SB → black screen**.
+- Decision: **disable Secure Boot in BIOS** for the install (simplest tonight; re-enable + enroll MOK + sign later once proven).
+- Safety checks before SB-off: **no LUKS / no TPM auto-unlock** (so no passphrase prompt on Linux). BUT **dual-boot Windows present** (`Boot0002 Windows Boot Manager`) → if it has BitLocker, expect a recovery-key prompt next time Windows boots after SB-off (Linux unaffected). Recovery key at account.microsoft.com/devices/recoverykey.
+
+**Install procedure (staged, pending SB-off + my re-verify SB=0):**
+1. (BIOS) Disable Secure Boot → Save & Exit → boot to Linux. Claude re-checks `mokutil` reads disabled BEFORE install.
+2. `Ctrl+Alt+F3` → login → `sudo systemctl isolate multi-user.target`
+3. `sudo sh ~/DEV/nvidia-resume-fix/NVIDIA-Linux-x86_64-610.43.02.run --kernel-module-type=open` (accept license; continue past the distro-driver warning; yes to rebuild initramfs)
+4. `sudo reboot`
+5. Verify `cat /proc/driver/nvidia/version` = 610.43.02 → deep-S3 suspend → check plasmashell survives (the bug repro). Clean = real fix.
+
+**Recovery net (if black screen / broken):** `Ctrl+Alt+F3` → `sudo bash ~/DEV/nvidia-resume-fix/RECOVERY-restore-stock-driver.sh` (uninstalls .run, reinstalls `nvidia-driver-595-open=595.71.05-0ubuntu0.26.04.1` + initramfs) → reboot → back to exactly current state.
+
+**CURRENT STATE at log time:** still 100% stock — nothing installed, SB still ON, driver still 595.71.05. Next action = user reboots to disable Secure Boot, returns, Claude verifies SB=off, then Phase 2 install. If 610 fails at runtime, fall back to 595.84, then to recovery.
+
+### 2026-06-19 ~22:45 — 610.43.02 INSTALLED (3rd attempt); plasmashell crash = KDE-side; ZOMBIE verdict pending overnight
+
+Secure Boot disabled in BIOS. Install took 3 attempts, each peeling one blocker:
+1. SB on → unsigned module blocked (fixed: SB off).
+2. old 595 driver pinned by nvidia-persistenced → version mismatch (fixed: script stops daemons + `modprobe -r` before install).
+3. apt 595 module files still on disk → `nvidia.ko(610)`+`nvidia-modeset.ko(595)` mismatch (fixed: script purges apt 595 stack first; blast radius verified safe via `apt-get -s purge` sim — only nvidia-595 pkgs, NOT desktop/kernel/xorg-core).
+
+3rd run succeeded: `/proc/driver/nvidia/version` = 610.43.02, `nvidia.ko`+`nvidia-modeset.ko` both 610, nvidia-smi healthy, desktop up. (Did the install over SSH from the Mac because VT-switch to a console showed a dark screen — the GPU modeset-on-VT-switch is itself flaky; installed `openssh-server`, opened ufw 22.)
+
+**Findings:**
+- **610 did NOT fix the plasmashell resume crash.** Signature shifted 595 SIGABRT(`Context is lost`) → 610 **SIGSEGV**, but plasmashell still dies on every resume. Persisting across two very different drivers **confirms it is KDE/plasmashell-side, not driver.** kwin survives intact (same pid, no restart) every cycle → the display always returns; the crash is cosmetic and auto-respawns. Proven NOT a zombie precursor (no kernel stall in the resume window).
+- **ZOMBIE verdict still open.** One 610 resume survived clean (no `hung_task`/`Xid`/stall). User left the PC on S3 sleep **overnight 2026-06-19→20** as the long-duration test (long suspends were when the worst zombie hit). Morning: boot_id unchanged = survived (610 likely fixed it); hard-reset needed = zombie alive → driver-deep, go path 2 (patch nvidia-drm sync-surface, source in `~/DEV/nvidia-resume-fix/ogkm-610`) or different kernel.
+
+**Decision groundwork (see `~/DEV/nvidia-resume-fix/SITUATION-BRIEF.md`):** if zombie gone → war won, only the cosmetic crash remains → tolerate it or `apt install` GNOME on Ubuntu (mutter dodges it, no reinstall). Distro options weighed: GNOME-on-Ubuntu (cheapest), Fedora 44 (btrfs+akmod but coin-flip on zombie, same driver), COSMIC (least mature, wrong tool), Plasma 6.7 (no clean source/rollback on ext4). Bigger picture: user's appetite (newest DE + rollback) = Fedora/openSUSE+btrfs territory, not Ubuntu LTS+ext4. Follow-ups: re-enable Secure Boot + MOK-sign 610 once proven; SB currently OFF.
+
+### 2026-06-20 morning — OVERNIGHT TEST PASSED: 610 beat the zombie (strong, not yet statistical)
+
+Left on S3 overnight. Result: **survived clean.** `23:35:33 PM: suspend entry (deep)` → `05:05:16 PM: suspend exit` → `Operation suspend finished` = a **5.5-hour deep suspend resumed cleanly.** Same boot_id (no hard-reset), uptime 6h27m, zero hung_task/rcu/Xid/lockup, nvidia-smi healthy 35°C. Context: the original zombie was an 83-min suspend that never woke on 595 — 610 passed a suspend 4× longer (the worst-case long-duration condition). **And the cosmetic plasmashell crash did NOT recur on the 05:05 resume** (plasmashell still pid 5694 from last night's respawn → survived this wake untouched).
+
+**Verdict:** 610.43.02 appears to fix the zombie. Caveat — this is ~2 resume cycles; the zombie was intermittent (~1-in-4), so call it CONFIRMED only after several more days of normal-use resumes with no hard-reset. But a 5.5h clean resume on the worst-case condition is the strongest single data point we could get. Distro/DE switch = **moot if this holds** (stay KDE + 610).
+
+**Two loose ends (housekeeping, not blockers):**
+1. **Secure Boot is OFF** — 610 .run module is unsigned. Re-enable SB + generate/enroll a MOK + sign the 4 modules (nvidia, nvidia-modeset, nvidia-drm, nvidia-uvm) so it loads under SB again (also clears the dual-boot Windows/BitLocker exposure).
+2. **No DKMS** — 610 was .run-installed without dkms. **Next Ubuntu kernel update will break it** (module won't auto-rebuild → black screen on the new kernel). Fix: register dkms, OR `apt-mark hold` the kernel, OR re-run the .run after each kernel bump. Flag before any kernel upgrade.
+
+### 2026-06-20 morning — DKMS DONE; fix sealed
+Ran `~/dkms-610.sh` (over Mac SSH): installed `dkms`, re-ran the 610 .run with `--dkms --kernel-module-type=open`. Post-reboot verified: driver 610.43.02 loaded, `dkms status` = `nvidia/610.43.02, 7.0.0-22-generic: installed`, desktop healthy, `10_nvidia.json` EGL vendor config present (the libglvnd warning during install was harmless). **Kernel updates are now safe — DKMS rebuilds the module on each one.** No kernel hold needed. Secure Boot intentionally left OFF (user's call; unsigned module is fine with SB off). 
+
+**STATUS: RESOLVED (pending a few more days of normal-use resumes to call the zombie statistically dead).** Loose ends both closed. Remaining = optional/creative: publish the tooling + case-study to git; write the blog post. Driver-maintenance note for future: this is a .run+dkms install (NOT apt) — if ever switching back to apt nvidia, purge the .run first via `nvidia-installer --uninstall`.
